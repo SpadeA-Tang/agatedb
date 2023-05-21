@@ -287,6 +287,7 @@ impl Transaction {
         // it after pushing the entries to it.
         let write_ch_lock = orc.write_ch_lock.lock().unwrap();
 
+        // spadea: to read
         let (commit_ts, conflict) = orc.new_commit_ts(self);
         if conflict {
             return Err(Error::CustomError(
@@ -316,6 +317,7 @@ impl Transaction {
         let mut entries =
             Vec::with_capacity(self.pending_writes.len() + self.duplicate_writes.len() + 1);
 
+        // spadea: is this copied unnecessary and can be optimized
         let process_entry = |entries: &mut Vec<Entry>, mut e: Entry| {
             let mut key = BytesMut::new();
             key.extend_from_slice(&e.key);
