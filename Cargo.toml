@@ -69,3 +69,15 @@ incremental = false
 debug-assertions = false
 overflow-checks = false
 rpath = false
+
+[profile.test]
+opt-level = 0
+debug = true
+
+[profile.dev.package.tests]
+opt-level = 0
+debug = true
+
+[profile.dev]
+opt-level = 0
+debug = true

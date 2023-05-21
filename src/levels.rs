@@ -247,6 +247,7 @@ impl LevelsControllerInner {
         kr: &KeyRange,
         compact_def: &CompactDef,
     ) -> Result<Vec<Table>> {
+        println!("sub compaction, range {:?}", kr);
         let has_overlap =
             self.check_overlap(&compact_def.all_tables(), compact_def.next_level_id + 1);
 
@@ -299,6 +300,7 @@ impl LevelsControllerInner {
             // Do the iteration and add keys to builder.
             while iter.valid() {
                 let iter_key = Bytes::copy_from_slice(iter.key());
+                println!("compaction: cur_key {:?}", iter_key);
 
                 // See if we need to skip the prefix.
                 if !compact_def.drop_prefixes.is_empty()
@@ -410,6 +412,7 @@ impl LevelsControllerInner {
 
                 num_keys += 1;
 
+                // spadea: how about those without value pointer?
                 if vs.meta & crate::value::VALUE_POINTER != 0 {
                     vp.decode(&vs.value);
                 }
@@ -470,11 +473,13 @@ impl LevelsControllerInner {
 
             if level == 0 {
                 for table in compact_def.top.iter().rev() {
+                    println!("level 0 top table id {}", table.id());
                     iters.push(TableIterators::from(
                         table.new_iterator(crate::table::ITERATOR_NOCACHE),
                     ));
                 }
             } else if !compact_def.top.is_empty() {
+                println!("top table id {}", compact_def.top[0].id());
                 assert_eq!(compact_def.top.len(), 1);
                 iters.push(TableIterators::from(
                     compact_def.top[0].new_iterator(crate::table::ITERATOR_NOCACHE),
@@ -483,6 +488,7 @@ impl LevelsControllerInner {
 
             // TODO: Use ConcatIterator.
             for table in valid {
+                println!("bottom table id {}", table.id());
                 iters.push(TableIterators::from(
                     table.new_iterator(crate::table::ITERATOR_NOCACHE),
                 ));

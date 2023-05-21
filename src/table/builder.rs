@@ -67,11 +67,15 @@ impl Builder {
         self.key_hashes.push(farmhash::fingerprint32(user_key(key)));
         // TODO: check ts
         let diff_key = if self.base_key.is_empty() {
+            println!("set base key {:?}", key);
             self.base_key = key.clone();
             key
         } else {
             self.key_diff(key)
         };
+
+        println!("compaction: add key {:?}", key);
+
         assert!(key.len() - diff_key.len() <= u16::MAX as usize);
         assert!(diff_key.len() <= u16::MAX as usize);
         let h = Header {
@@ -113,6 +117,7 @@ impl Builder {
             offset: self.base_offset,
             len: self.buf.len() as u32 - self.base_offset,
         };
+        println!("add block index {:?}", block);
         self.table_index.offsets.push(block);
     }
 
@@ -137,6 +142,7 @@ impl Builder {
     /// Add key-value pair to table
     pub fn add(&mut self, key: &Bytes, value: &Value, vlog_len: u32) {
         if self.should_finish_block(key, value) {
+            println!("finish block");
             self.finish_block();
             self.base_key.clear();
             assert!(self.buf.len() < u32::MAX as usize);
