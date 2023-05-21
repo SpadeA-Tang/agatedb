@@ -115,7 +115,19 @@ impl LevelsControllerInner {
         Ok(inner)
     }
 
-    /// Calculates the [`Targets`] for levels in the LSM tree.
+    // Calculate the targets for levels in the LSM tree. The idea comes from Dynamic Level
+    // Sizes ( https://rocksdb.org/blog/2015/07/23/dynamic-level.html ) in RocksDB. The sizes of levels
+    // are calculated based on the size of the lowest level, typically L6. So, if L6 size is 1GB, then
+    // L5 target size is 100MB, L4 target size is 10MB and so on.
+    //
+    // L0 files don't automatically go to L1. Instead, they get compacted to Lbase, where Lbase is
+    // chosen based on the first level which is non-empty from top (check L1 through L6). For an empty
+    // DB, that would be L6.  So, L0 compactions go to L6, then L5, L4 and so on.
+    //
+    // Lbase is advanced to the upper levels when its target size exceeds BaseLevelSize. For
+    // example, when L6 reaches 1.1GB, then L4 target sizes becomes 11MB, thus exceeding the
+    // BaseLevelSize of 10MB. L3 would then become the new Lbase, with a target size of 1MB <
+    // BaseLevelSize.
     fn level_targets(&self) -> Targets {
         let adjust = |size| {
             if size < self.opts.base_level_size {
@@ -240,7 +252,13 @@ impl LevelsControllerInner {
         false
     }
 
-    /// Runs a single sub-compaction, iterating over the specified key-range only.
+    // It runs a single sub-compaction, iterating over the specified key-range only.
+    //
+    // We use splits to do a single compaction concurrently. If we have >= 3 tables
+    // involved in the bottom level during compaction, we choose key ranges to
+    // split the main compaction up into sub-compactions. Each sub-compaction runs
+    // concurrently, only iterating over the provided key range, generating tables.
+    // This speeds up the compaction significantly.
     fn sub_compact(
         self: &Arc<Self>,
         mut iter: Box<TableIterators>,
@@ -248,9 +266,15 @@ impl LevelsControllerInner {
         compact_def: &CompactDef,
     ) -> Result<Vec<Table>> {
         println!("sub compaction, range {:?}", kr);
+
+        // Check overlap of the top level with the levels which are not being
+        // compacted in this compaction.
         let has_overlap =
             self.check_overlap(&compact_def.all_tables(), compact_def.next_level_id + 1);
 
+        // Pick a discard ts, so we can discard versions below this ts. We should
+        // never discard any versions starting from above this timestamp, because
+        // that would affect the snapshot view guarantee provided by transactions.
         let discard_ts = self.orc.discard_at_or_below();
 
         // TODO: Collect stats for GC.
