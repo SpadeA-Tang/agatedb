@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize},
-        Arc, RwLock,
+        Arc, RwLock, RwLockReadGuard,
     },
     thread::JoinHandle,
 };
@@ -692,6 +692,34 @@ impl Core {
         }
 
         self.vlog.as_ref().as_ref().unwrap().run_gc(discard_ratio)
+    }
+
+    fn rewrite(&self, log_file: &RwLockReadGuard<Wal>) -> Result<()> {
+        let mut inner = self.vlog.as_ref().as_ref().unwrap().inner.write().unwrap();
+        let fid = log_file.file_id();
+        if inner
+            .files_to_delete
+            .iter()
+            .find(|id| **id == fid)
+            .is_some()
+        {
+            return Err(Error::Other(format!(
+                "value log file already marked for deletion fid {}",
+                fid
+            )));
+        }
+
+        let max_fid = inner.max_fid;
+        assert!(fid < max_fid);
+
+        info!("Rewriting fid: {}", fid);
+        let mut wb: Vec<Entry> = Vec::with_capacity(1000);
+        let mut size = 0;
+        let (mut count, mut moved) = (0, 0);
+
+        let fe = |e: Entry| -> Result<()> { unimplemented!() };
+
+        Ok(())
     }
 }
 

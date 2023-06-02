@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, RwLock,
+        Arc, RwLock, RwLockReadGuard,
     },
 };
 
@@ -14,10 +14,11 @@ use log::{debug, error, info};
 
 use crate::{
     discard::DiscardStats,
+    entry::Entry,
     error,
     value::{self, Request, ValuePointer},
     wal::{Header, Wal},
-    AgateOptions, Error, Result,
+    Agate, AgateOptions, Error, Result,
 };
 
 fn vlog_file_path(dir: impl AsRef<Path>, fid: u32) -> PathBuf {
@@ -32,8 +33,8 @@ struct ValueLogInner {
     /// and previous logs, so as to reduce usage of `RwLock`.
     files_map: HashMap<u32, Arc<RwLock<Wal>>>,
     /// maximum file ID opened
-    max_fid: u32,
-    files_to_delete: Vec<u32>,
+    pub(crate) max_fid: u32,
+    pub(crate) files_to_delete: Vec<u32>,
     num_entries_written: u32,
 }
 
@@ -68,7 +69,7 @@ pub struct ValueLog {
     /// value log directory
     dir_path: PathBuf,
     /// value log file mapping, use `RwLock` to support concurrent read
-    inner: Arc<RwLock<ValueLogInner>>,
+    pub(crate) inner: Arc<RwLock<ValueLogInner>>,
     /// offset of next write
     writeable_log_offset: AtomicU32,
     opts: AgateOptions,
@@ -433,14 +434,37 @@ impl ValueLog {
 
     fn do_run_gc(&self, log_file: Arc<RwLock<Wal>>) -> Result<()> {
         // spadea(todo): port span
-        let fid = log_file.read().unwrap().file_id();
-        self.rewrite(log_file)?;
+        let log_file = log_file.read().unwrap();
+        let fid = log_file.file_id();
+        self.rewrite(&log_file)?;
+        // Remove the file from discardStats.
         self.discard_stats.update(fid, -1);
         Ok(())
     }
 
-    fn rewrite(&self, _log_file: Arc<RwLock<Wal>>) -> Result<()> {
-        unimplemented!()
+    fn rewrite(&self, log_file: &RwLockReadGuard<Wal>) -> Result<()> {
+        let mut inner = self.inner.write().unwrap();
+        let fid = log_file.file_id();
+        if inner
+            .files_to_delete
+            .iter()
+            .find(|id| **id == fid)
+            .is_some()
+        {
+            return Err(Error::Other(format!(
+                "value log file already marked for deletion fid {}",
+                fid
+            )));
+        }
+
+        let max_fid = inner.max_fid;
+        assert!(fid < max_fid);
+
+        info!("Rewriting fid: {}", fid);
+        let mut wb: Vec<Entry> = Vec::with_capacity(1000);
+        let mut size = 0;
+
+        Ok(())
     }
 
     pub(crate) fn discard_stats(&self) -> &DiscardStats {
