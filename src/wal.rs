@@ -2,7 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Cursor,
     mem::ManuallyDrop,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -83,6 +83,7 @@ impl Header {
 /// encryption and compression. These will be done later.
 /// TODO: delete WAL file when reference to WAL (or memtable) comes to 0
 pub struct Wal {
+    fid: u32,
     path: PathBuf,
     file: ManuallyDrop<File>,
     mmap_file: ManuallyDrop<MmapMut>,
@@ -96,7 +97,7 @@ pub struct Wal {
 
 impl Wal {
     /// open or create a WAL from options
-    pub fn open(path: PathBuf, opts: AgateOptions) -> Result<Wal> {
+    pub fn open(fid: u32, path: PathBuf, opts: AgateOptions) -> Result<Wal> {
         let (file, bootstrap) = if path.exists() {
             (
                 OpenOptions::new()
@@ -119,6 +120,7 @@ impl Wal {
         };
         let mmap_file = unsafe { MmapOptions::new().map_mut(&file)? };
         let mut wal = Wal {
+            fid,
             path,
             file: ManuallyDrop::new(file),
             size: mmap_file.len() as u32,
@@ -143,6 +145,10 @@ impl Wal {
     fn bootstrap(&mut self) -> Result<()> {
         self.zero_next_entry()?;
         Ok(())
+    }
+
+    pub(crate) fn file_id(&self) -> u32 {
+        self.fid
     }
 
     pub(crate) fn write_entry(&mut self, entry: &Entry) -> Result<()> {
@@ -309,6 +315,14 @@ impl Wal {
         }
         Ok(())
     }
+
+    pub fn file(&self) -> &ManuallyDrop<File> {
+        &self.file
+    }
+
+    pub fn file_path(&self) -> &Path {
+        self.path.as_path()
+    }
 }
 
 impl Drop for Wal {
@@ -411,7 +425,7 @@ mod tests {
             ..Default::default()
         };
         let wal_path = tmp_dir.path().join("1.wal");
-        let mut wal = Wal::open(wal_path.clone(), opts.clone()).unwrap();
+        let mut wal = Wal::open(1, wal_path.clone(), opts.clone()).unwrap();
         for i in 0..20 {
             let entry = Entry::new(Bytes::from(i.to_string()), Bytes::from(i.to_string()));
             wal.write_entry(&entry).unwrap();

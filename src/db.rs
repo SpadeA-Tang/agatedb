@@ -216,7 +216,7 @@ impl Core {
             return Ok(MemTable::new(file_id, skl, None, opts.clone()));
         }
 
-        let wal = Wal::open(path, opts.clone())?;
+        let wal = Wal::open(file_id as u32, path, opts.clone())?;
         // TODO: delete WAL when skiplist ref count becomes zero
 
         let mem_table = MemTable::new(file_id, skl, Some(wal), opts.clone());

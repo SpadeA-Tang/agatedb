@@ -64,7 +64,8 @@ impl DiscardStats {
     // Update would update the discard stats for the given file id. If discard is
     // 0, it would return the current value of discard for the file. If discard is
     // < 0, it would set the current value of discard to zero for the file.
-    pub fn update(&self, fid: u64, discard: isize) -> u64 {
+    pub fn update(&self, fid: u32, discard: isize) -> u64 {
+        let fid = fid as u64;
         let mut inner = self.inner.write().unwrap();
         let idx = util::search(inner.next_empty_slot, |slot| -> bool {
             inner.get(slot * 16) >= fid
@@ -116,7 +117,7 @@ impl DiscardStats {
         }
     }
 
-    pub(crate) fn max_discard(&self) -> (u64, u64) {
+    pub(crate) fn max_discard(&self) -> (u32, u64) {
         let (mut max_fid, mut max_val) = (0, 0);
         self.iterate(|fid, val| {
             if max_val < val {
@@ -125,7 +126,7 @@ impl DiscardStats {
             }
         });
 
-        (max_fid, max_val)
+        (max_fid as u32, max_val)
     }
 }
 

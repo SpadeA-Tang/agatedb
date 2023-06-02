@@ -1,11 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
     iter::FromIterator,
+    os::unix::prelude::MetadataExt,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicU32, Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, RwLock,
+    },
 };
 
 use bytes::{Bytes, BytesMut};
+use log::{debug, error, info};
 
 use crate::{
     discard::DiscardStats,
@@ -68,6 +73,7 @@ pub struct ValueLog {
     writeable_log_offset: AtomicU32,
     opts: AgateOptions,
 
+    gc_running: AtomicBool,
     discard_stats: DiscardStats,
 }
 
@@ -84,6 +90,7 @@ impl ValueLog {
                 dir_path: opts.value_dir.clone(),
                 opts,
                 writeable_log_offset: AtomicU32::new(0),
+                gc_running: AtomicBool::new(false),
             };
 
             // TODO: garbage collection
@@ -113,7 +120,7 @@ impl ValueLog {
                         let fid: u32 = filename[..filename.len() - 5].parse().map_err(|err| {
                             Error::InvalidFilename(format!("failed to parse file ID {:?}", err))
                         })?;
-                        let wal = Wal::open(file.path(), self.opts.clone())?;
+                        let wal = Wal::open(fid, file.path(), self.opts.clone())?;
                         let wal = Arc::new(RwLock::new(wal));
                         if inner.files_map.insert(fid, wal).is_some() {
                             return Err(Error::InvalidFilename(format!(
@@ -142,7 +149,7 @@ impl ValueLog {
         let mut inner = self.inner.write().unwrap();
         let fid = inner.max_fid + 1;
         let path = self.file_path(fid);
-        let wal = Wal::open(path, self.opts.clone())?;
+        let wal = Wal::open(fid, path, self.opts.clone())?;
         // TODO: only create new files
         let wal = Arc::new(RwLock::new(wal));
         assert!(inner.files_map.insert(fid, wal.clone()).is_none());
@@ -352,11 +359,87 @@ impl ValueLog {
         Ok(original_buf)
     }
 
-    pub(crate) fn run_gc(&self, _discard_ratio: f64) -> Result<()> {
-        unimplemented!()
+    pub(crate) fn run_gc(&self, discard_ratio: f64) -> Result<()> {
+        // spadea(todo): downgrade ordering
+        let _ = self
+            .gc_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| Error::ErrRejected)?;
+
+        let lf = self.pick_log(discard_ratio).ok_or(Error::ErrNoRewrite)?;
+        let gc_result = self.do_run_gc(lf);
+
+        self.gc_running.store(false, Ordering::SeqCst);
+        gc_result
     }
 
-    fn pick_log(&self, _discard_ratio: f64) -> Arc<RwLock<Wal>> {
+    fn pick_log(&self, discard_ratio: f64) -> Option<Arc<RwLock<Wal>>> {
+        let inner = self.inner.read().unwrap();
+
+        loop {
+            // Pick a candidate that contains the largest amount of discardable data
+            let (fid, discard) = self.discard_stats.max_discard();
+
+            // max_discard will return fid=0 if it doesn't have any discard data. The
+            // vlog files start from 1.
+            if fid == 0 {
+                info!("No file with discard stats");
+            }
+            let lf = match inner.files_map.get(&fid) {
+                Some(lf) => lf.read().unwrap(),
+                None => {
+                    // This file was deleted but it's discard stats increased because of compactions. The file
+                    // doesn't exist so we don't need to do anything. Skip it and retry.
+                    self.discard_stats.update(fid, -1);
+                    continue;
+                }
+            };
+
+            let file_size = match lf.file().metadata() {
+                Ok(meta) => meta.size(),
+                Err(e) => {
+                    error!(
+                        "Unable to get stats for value log fid: {} err: {:?}",
+                        fid, e
+                    );
+                    return None;
+                }
+            };
+
+            let thr = file_size as f64 * discard_ratio;
+            // rust does not support comparison between float
+            if discard < thr as u64 {
+                debug!(
+                    "Discard: {} less than threshold: {} for file: {:?}",
+                    discard,
+                    thr,
+                    lf.file_path()
+                );
+                return None;
+            }
+
+            if fid < inner.max_fid {
+                info!(
+                    "Found value log max discard fid: {} discard: {}",
+                    fid, discard
+                );
+
+                return Some(inner.files_map.get(&fid).unwrap().clone());
+            }
+
+            return None;
+        }
+    }
+
+    fn do_run_gc(&self, log_file: Arc<RwLock<Wal>>) -> Result<()> {
+        // spadea(todo): port span
+        let fid = log_file.read().unwrap().file_id();
+        self.rewrite(log_file)?;
+        self.discard_stats.update(fid, -1);
+        Ok(())
+    }
+
+    fn rewrite(&self, _log_file: Arc<RwLock<Wal>>) -> Result<()> {
         unimplemented!()
     }
 
