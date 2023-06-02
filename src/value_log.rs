@@ -8,6 +8,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 
 use crate::{
+    discard::DiscardStats,
     error,
     value::{self, Request, ValuePointer},
     wal::{Header, Wal},
@@ -66,6 +67,8 @@ pub struct ValueLog {
     /// offset of next write
     writeable_log_offset: AtomicU32,
     opts: AgateOptions,
+
+    discard_stats: DiscardStats,
 }
 
 impl ValueLog {
@@ -76,13 +79,14 @@ impl ValueLog {
             None
         } else {
             let inner = Self {
+                discard_stats: DiscardStats::init_discard_stats(opts.clone())?,
                 inner: Arc::new(RwLock::new(ValueLogInner::new())),
                 dir_path: opts.value_dir.clone(),
                 opts,
                 writeable_log_offset: AtomicU32::new(0),
             };
+
             // TODO: garbage collection
-            // TODO: discard stats
             inner.open()?;
             Some(inner)
         };
@@ -158,7 +162,6 @@ impl ValueLog {
         let mut result = inner
             .files_map
             .keys()
-            .into_iter()
             .filter(|k| !to_be_deleted.contains(k))
             .cloned()
             .collect::<Vec<u32>>();
@@ -347,6 +350,18 @@ impl ValueLog {
             });
         }
         Ok(original_buf)
+    }
+
+    pub(crate) fn run_gc(&self, _discard_ratio: f64) -> Result<()> {
+        unimplemented!()
+    }
+
+    fn pick_log(&self, _discard_ratio: f64) -> Arc<RwLock<Wal>> {
+        unimplemented!()
+    }
+
+    pub(crate) fn discard_stats(&self) -> &DiscardStats {
+        &self.discard_stats
     }
 }
 
