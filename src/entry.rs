@@ -25,6 +25,17 @@ impl<'a> EntryRef<'a> {
     pub fn is_zero(&self) -> bool {
         self.key.is_empty()
     }
+
+    pub fn to_owned(&self) -> Entry {
+        Entry {
+            key: Bytes::from(self.key),
+            value: Bytes::from(self.value),
+            meta: self.meta,
+            user_meta: self.user_meta,
+            expires_at: self.expires_at,
+            version: self.version,
+        }
+    }
 }
 
 impl Entry {

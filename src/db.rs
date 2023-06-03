@@ -13,23 +13,24 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
-use log::{debug, info};
+use log::{debug, info, warn};
 pub use opt::AgateOptions;
 use skiplist::Skiplist;
 use yatp::task::callback::Handle;
 
 use crate::{
     closer::Closer,
-    entry::Entry,
+    entry::{Entry, EntryRef},
     get_ts,
+    iterator::is_deleted_or_expired,
     levels::LevelsController,
     manifest::ManifestFile,
     memtable::{MemTable, MemTables},
     ops::oracle::Oracle,
     opt::build_table_options,
     util::{has_any_prefixes, make_comparator},
-    value::{self, Request, Value, ValuePointer},
-    value_log::ValueLog,
+    value::{self, Request, Value, ValuePointer, VALUE_FIN_TXN, VALUE_POINTER, VALUE_TXN},
+    value_log::{ValueLog, ValueLogWrapper},
     wal::Wal,
     Error, Result, Table, TableBuilder, TableOptions,
 };
@@ -51,7 +52,7 @@ pub struct Core {
     pub(crate) opts: AgateOptions,
     pub(crate) manifest: Arc<ManifestFile>,
     pub(crate) lvctl: LevelsController,
-    pub(crate) vlog: Arc<Option<ValueLog>>,
+    pub(crate) vlog: ValueLogWrapper,
     write_channel: (Sender<Request>, Receiver<Request>),
     flush_channel: (Sender<Option<FlushTask>>, Receiver<Option<FlushTask>>),
 
@@ -181,7 +182,7 @@ impl Core {
             opts: opts.clone(),
             manifest,
             lvctl,
-            vlog: Arc::new(ValueLog::new(opts.clone())?),
+            vlog: ValueLogWrapper(Arc::new(ValueLog::new(opts.clone())?)),
             write_channel: bounded(KV_WRITE_CH_CAPACITY),
             flush_channel: crossbeam_channel::bounded(opts.num_memtables),
             block_writes: AtomicBool::new(false),
@@ -503,7 +504,7 @@ impl Core {
         let dones: Vec<_> = requests.iter().map(|x| x.done.clone()).collect();
 
         let write = || {
-            if let Some(ref vlog) = *self.vlog {
+            if let Some(ref vlog) = **self.vlog {
                 vlog.write(&mut requests)?;
             }
 
@@ -717,10 +718,198 @@ impl Core {
         let mut size = 0;
         let (mut count, mut moved) = (0, 0);
 
-        let fe = |e: Entry| -> Result<()> { unimplemented!() };
+        let fe = |e: EntryRef| -> Result<()> {
+            count += 1;
+            if count % 100000 == 0 {
+                debug!("Processing entry {:?}", count);
+            }
+
+            // spadea(todo): can we avoid clone?
+            let val = self.get(&Bytes::from(e.key.to_vec()))?;
+            if discard_entry(&e, &val) {
+                return Ok(());
+            }
+
+            // Value is still present in value log
+
+            if val.value.len() == 0 {
+                return Err(Error::Other(format!("Empty value {:?}", val)));
+            }
+
+            let mut vp = ValuePointer::default();
+            vp.decode(&val.value);
+
+            // If the entry found from the LSM Tree points to a newer vlog file,
+            // don't do anything.
+            if vp.file_id > fid {
+                return Ok(());
+            }
+
+            // If the entry found from the LSM Tree points to an offset greater than the one
+            // read from vlog, don't do anything.
+            // if vp.offset > e.offset {
+            //     // todo: no offset now
+            //     return Ok(());
+            // }
+
+            // If the entry read from LSM Tree and vlog file point to the same vlog file and offset,
+            // insert them back into the DB.
+            // NOTE: It might be possible that the entry read from the LSM Tree points to
+            // an older vlog file. See the comments in the else part.
+            if vp.file_id == fid && vp.offset == e.offset {
+                moved += 1;
+                let mut new_entry = e.to_owned();
+                new_entry.meta = e.meta & (!(VALUE_POINTER | VALUE_TXN | VALUE_FIN_TXN));
+                let es = new_entry.estimate_size(self.opts.value_threshold);
+                // Consider size of value as well while considering the total size
+                // of the batch. There have been reports of high memory usage in
+                // rewrite because we don't consider the value size. See #1292.
+                es += e.value.len();
+
+                // Ensure length and size of wb is within transaction limits.
+                if wb.len() + 1 >= self.opts.max_batch_count as usize
+                    || size + es > self.opts.max_batch_size as usize
+                {
+                    self.batch_set(wb)?;
+                    size = 0;
+                    wb.clear();
+                }
+
+                wb.push(new_entry);
+                size += es;
+            } else {
+                // It might be possible that the entry read from LSM Tree points to
+                // an older vlog file.  This can happen in the following situation.
+                // Assume DB is opened with
+                // numberOfVersionsToKeep=1
+                //
+                // Now, if we have ONLY one key in the system "FOO" which has been
+                // updated 3 times and the same key has been garbage collected 3
+                // times, we'll have 3 versions of the movekey
+                // for the same key "FOO".
+                //
+                // NOTE: moveKeyi is the gc'ed version of the original key with version i
+                // We're calling the gc'ed keys as moveKey to simplify the
+                // explanantion. We used to add move keys but we no longer do that.
+                //
+                // Assume we have 3 move keys in L0.
+                // - moveKey1 (points to vlog file 10),
+                // - moveKey2 (points to vlog file 14) and
+                // - moveKey3 (points to vlog file 15).
+                //
+                // Also, assume there is another move key "moveKey1" (points to
+                // vlog file 6) (this is also a move Key for key "FOO" ) on upper
+                // levels (let's say 3). The move key "moveKey1" on level 0 was
+                // inserted because vlog file 6 was GCed.
+                //
+                // Here's what the arrangement looks like
+                // L0 => (moveKey1 => vlog10), (moveKey2 => vlog14), (moveKey3 => vlog15)
+                // L1 => ....
+                // L2 => ....
+                // L3 => (moveKey1 => vlog6)
+                //
+                // When L0 compaction runs, it keeps only moveKey3 because the number of versions
+                // to keep is set to 1. (we've dropped moveKey1's latest version)
+                //
+                // The new arrangement of keys is
+                // L0 => ....
+                // L1 => (moveKey3 => vlog15)
+                // L2 => ....
+                // L3 => (moveKey1 => vlog6)
+                //
+                // Now if we try to GC vlog file 10, the entry read from vlog file
+                // will point to vlog10 but the entry read from LSM Tree will point
+                // to vlog6. The move key read from LSM tree will point to vlog6
+                // because we've asked for version 1 of the move key.
+                //
+                // This might seem like an issue but it's not really an issue
+                // because the user has set the number of versions to keep to 1 and
+                // the latest version of moveKey points to the correct vlog file
+                // and offset. The stale move key on L3 will be eventually dropped
+                // by compaction because there is a newer versions in the upper
+                // levels.
+            }
+
+            Ok(())
+        };
+
+        let mut iter = log_file.iter().unwrap();
+        while let Some(e) = iter.next()? {
+            fe(e)?;
+        }
+
+        let mut batch_size = 1024;
+        let mut loops = 0;
+        let mut i = 0;
+        while i < wb.len() {
+            loops += 1;
+            if batch_size == 0 {
+                warn!("We shouldn't reach batch size of zero.");
+                return Err(Error::ErrNoRewrite);
+            }
+
+            let end = usize::min(i + batch_size, wb.len());
+            match self.batch_set(wb[i..end].to_vec()) {
+                Err(Error::TxnTooBig) => {
+                    batch_size = batch_size / 2;
+                    continue;
+                }
+                e @ Err(_) => return e,
+                _ => {}
+            }
+            i += batch_size;
+        }
+
+        info!("Processed {} entries in {} loops", wb.len(), loops);
+        info!("Total entries: {}. Moved: {}", count, moved);
+        info!("Removing fid: {}", fid);
+
+        let mut delete_file_now = false;
+        if inner.files_map.get(&fid).is_none() {
+            return Err(Error::Other(format!("Unable to find fid {}", fid)));
+        }
+
+        // no other object holding it
+        if Arc::strong_count(&self.vlog) == 1 {
+            inner.files_map.remove(&fid);
+            delete_file_now = true;
+        } else {
+            inner.files_to_delete.push(fid);
+        }
+
+        if delete_file_now {
+            // todo
+        }
 
         Ok(())
     }
+
+    fn batch_set(&self, entries: Vec<Entry>) -> Result<()> {
+        let done = self.send_to_write_channel(entries)?;
+        done.recv().unwrap()
+    }
+}
+
+fn discard_entry(e: &EntryRef, val: &Value) -> bool {
+    if val.version != get_ts(e.key) {
+        // Version not found. Discard.
+        return true;
+    }
+
+    if is_deleted_or_expired(val.meta, val.expires_at) {
+        return true;
+    }
+
+    if val.meta & VALUE_POINTER == 0 {
+        // Key also stores the value in LSM. Discard.
+        return true;
+    }
+
+    if val.meta & VALUE_FIN_TXN > 0 {
+        // Just a txn finish entry. Discard.
+        return true;
+    }
+    return false;
 }
 
 #[cfg(test)]

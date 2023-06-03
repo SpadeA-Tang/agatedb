@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     iter::FromIterator,
+    ops::{Deref, DerefMut},
     os::unix::prelude::MetadataExt,
     path::{Path, PathBuf},
     sync::{
@@ -18,7 +19,7 @@ use crate::{
     error,
     value::{self, Request, ValuePointer},
     wal::{Header, Wal},
-    Agate, AgateOptions, Error, Result,
+    AgateOptions, Error, Result,
 };
 
 fn vlog_file_path(dir: impl AsRef<Path>, fid: u32) -> PathBuf {
@@ -31,7 +32,7 @@ struct ValueLogInner {
     /// As we would concurrently read WAL, we need to wrap it with `RwLock`.
     /// TODO: use scheme like memtable to separate current vLog
     /// and previous logs, so as to reduce usage of `RwLock`.
-    files_map: HashMap<u32, Arc<RwLock<Wal>>>,
+    pub(crate) files_map: HashMap<u32, Arc<RwLock<Wal>>>,
     /// maximum file ID opened
     pub(crate) max_fid: u32,
     pub(crate) files_to_delete: Vec<u32>,
@@ -469,6 +470,33 @@ impl ValueLog {
 
     pub(crate) fn discard_stats(&self) -> &DiscardStats {
         &self.discard_stats
+    }
+}
+
+pub struct ValueLogWrapper(pub Arc<Option<ValueLog>>);
+
+impl Deref for ValueLogWrapper {
+    type Target = Arc<Option<ValueLog>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ValueLogWrapper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ValueLogWrapper {
+    fn drop(&mut self) {
+        // it is last second one (the last is hold by db)
+        if Arc::strong_count(&self.0) > 2 {
+            return;
+        }
+
+        unimplemented!()
     }
 }
 
