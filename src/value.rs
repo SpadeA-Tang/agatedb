@@ -2,6 +2,7 @@ use std::io::{Cursor, Read};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crossbeam_channel::Sender;
+use lazy_static::lazy_static;
 use prost::{decode_length_delimiter, encode_length_delimiter, length_delimiter_len};
 
 use crate::{
@@ -16,6 +17,13 @@ pub const VALUE_DISCARD_EARLIER_VERSIONS: u8 = 1 << 2;
 pub const VALUE_MERGE_ENTRY: u8 = 1 << 3;
 pub const VALUE_TXN: u8 = 1 << 6;
 pub const VALUE_FIN_TXN: u8 = 1 << 7;
+
+lazy_static! {
+    pub static ref HEADER_ENCODE_SIZE: usize = {
+        let head = Header::default();
+        head.encoded_len()
+    };
+}
 
 #[derive(Default, Debug, Clone, Eq, PartialEq)]
 pub struct Value {
@@ -117,6 +125,7 @@ pub struct EntryReader {
     key: Vec<u8>,
     value: Vec<u8>,
     header: Header,
+    offset: u32,
 }
 
 impl EntryReader {
@@ -125,6 +134,7 @@ impl EntryReader {
             key: vec![],
             value: vec![],
             header: Header::default(),
+            offset: 0,
         }
     }
 
@@ -140,6 +150,8 @@ impl EntryReader {
         reader.read_exact(&mut self.key)?;
         self.value.resize(self.header.value_len as usize, 0);
         reader.read_exact(&mut self.value)?;
+        let cur_offset = self.offset;
+        self.offset += (*HEADER_ENCODE_SIZE + self.key.len() + self.value.len()) as u32;
         Ok(EntryRef {
             key: &self.key,
             value: &self.value,
@@ -148,6 +160,7 @@ impl EntryReader {
             expires_at: self.header.expires_at,
             // This `version` is currently not used anywhere, and we may remove it later.
             version: 0,
+            offset: cur_offset,
         })
     }
 }

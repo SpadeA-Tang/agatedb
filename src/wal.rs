@@ -256,7 +256,7 @@ impl Wal {
     }
 
     /// Get WAL iterator
-    pub fn iter(&mut self) -> Result<WalIterator> {
+    pub fn iter(&self) -> Result<WalIterator> {
         Ok(WalIterator::new(Cursor::new(
             &self.mmap_file[0..self.size as usize],
         )))
@@ -419,7 +419,7 @@ mod tests {
         wal.close_and_save();
 
         // reopen WAL and iterate
-        let mut wal = Wal::open(wal_path, opts).unwrap();
+        let wal = Wal::open(wal_path, opts).unwrap();
         let mut it = wal.iter().unwrap();
         let mut cnt = 0;
         while let Some(entry) = it.next().unwrap() {
@@ -456,7 +456,7 @@ mod tests {
             drop(file);
 
             // reopen WAL and iterate
-            let mut wal = Wal::open(wal_path.clone(), opts.clone()).unwrap();
+            let wal = Wal::open(wal_path.clone(), opts.clone()).unwrap();
             let mut it = wal.iter().unwrap();
             let mut cnt = 0;
             while let Some(entry) = it.next().unwrap() {

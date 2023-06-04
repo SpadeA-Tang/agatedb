@@ -352,6 +352,10 @@ impl ValueLog {
         Ok(original_buf)
     }
 
+    pub(crate) fn get_log_file(&self, fid: u32) -> Option<Arc<RwLock<Wal>>> {
+        self.inner.read().unwrap().files_map.get(&fid).cloned()
+    }
+
     pub(crate) fn run_gc(&self, _discard_ratio: f64) -> Result<()> {
         unimplemented!()
     }
