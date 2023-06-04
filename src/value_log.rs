@@ -455,8 +455,6 @@ impl Drop for ValueLogWrapper {
         if self.0.as_ref().is_none() {
             return;
         }
-        // it is last second one (the last is hold by db)
-        println!("{}", Arc::strong_count(&self.0));
         if Arc::strong_count(&self.0) > 2 {
             return;
         }

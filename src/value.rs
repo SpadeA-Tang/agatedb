@@ -2,7 +2,6 @@ use std::io::{Cursor, Read};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crossbeam_channel::Sender;
-use lazy_static::lazy_static;
 use prost::{decode_length_delimiter, encode_length_delimiter, length_delimiter_len};
 
 use crate::{
@@ -17,13 +16,6 @@ pub const VALUE_DISCARD_EARLIER_VERSIONS: u8 = 1 << 2;
 pub const VALUE_MERGE_ENTRY: u8 = 1 << 3;
 pub const VALUE_TXN: u8 = 1 << 6;
 pub const VALUE_FIN_TXN: u8 = 1 << 7;
-
-lazy_static! {
-    pub static ref HEADER_ENCODE_SIZE: usize = {
-        let head = Header::default();
-        head.encoded_len()
-    };
-}
 
 #[derive(Default, Debug, Clone, Eq, PartialEq)]
 pub struct Value {
@@ -151,7 +143,7 @@ impl EntryReader {
         self.value.resize(self.header.value_len as usize, 0);
         reader.read_exact(&mut self.value)?;
         let cur_offset = self.offset;
-        self.offset += (*HEADER_ENCODE_SIZE + self.key.len() + self.value.len()) as u32;
+        self.offset += (self.header.encoded_len() + self.key.len() + self.value.len()) as u32;
         Ok(EntryRef {
             key: &self.key,
             value: &self.value,

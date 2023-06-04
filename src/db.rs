@@ -730,7 +730,7 @@ impl Core {
     }
 
     fn rewrite(&self, log_file: &RwLockReadGuard<Wal>) -> Result<()> {
-        let mut inner = self.vlog.as_ref().as_ref().unwrap().inner.write().unwrap();
+        let inner = self.vlog.as_ref().as_ref().unwrap().inner.read().unwrap();
         let fid = log_file.file_id();
         if inner.files_to_delete.iter().any(|id| *id == fid) {
             return Err(Error::Other(format!(
@@ -741,6 +741,8 @@ impl Core {
 
         let max_fid = inner.max_fid;
         assert!(fid < max_fid);
+        // spadea(todo): verify
+        drop(inner);
 
         info!("Rewriting fid: {}", fid);
         let mut wb: Vec<Entry> = Vec::with_capacity(1000);
@@ -893,6 +895,7 @@ impl Core {
         info!("Total entries: {}. Moved: {}", count, moved);
         info!("Removing fid: {}", fid);
 
+        let mut inner = self.vlog.as_ref().as_ref().unwrap().inner.write().unwrap();
         let mut delete_file_now = false;
         if inner.files_map.get(&fid).is_none() {
             return Err(Error::Other(format!("Unable to find fid {}", fid)));
@@ -944,3 +947,150 @@ fn discard_entry(e: &EntryRef, val: &Value) -> bool {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod test {
+    use crate::test_tuil::{txn_delete, txn_set};
+
+    use super::*;
+    use rand::distributions::{Alphanumeric, DistString};
+
+    #[test]
+    fn test_value_gc() {
+        let dir = tempdir::TempDir::new("gc-test").unwrap();
+        let mut opts = AgateOptions::default_for_test(dir.path());
+        opts.value_log_file_size = 1 << 20;
+        opts.base_table_size = 1 << 15;
+        opts.value_threshold = 1 << 10;
+
+        let db = opts.open().unwrap();
+
+        let sz = 32 << 10;
+        let mut txn = db.new_transaction(true);
+        for i in 0..100 {
+            let val = Alphanumeric.sample_string(&mut rand::thread_rng(), sz);
+            txn.set_entry(Entry::new(
+                Bytes::from(format!("key{:03}", i)),
+                Bytes::from(val),
+            ))
+            .unwrap();
+            if i % 20 == 0 {
+                txn.commit().unwrap();
+                txn = db.new_transaction(true);
+            }
+        }
+        txn.commit().unwrap();
+
+        for i in 0..45 {
+            txn_delete(&db, Bytes::from(format!("key{:03}", i)));
+        }
+
+        let log_file_path = {
+            let log_file = db.core.value_log().get_log_file(1).unwrap();
+            let log_file_gaurd = log_file.read().unwrap();
+            let path = log_file_gaurd.file_path().to_owned();
+
+            db.core.rewrite(&log_file_gaurd).unwrap();
+            path
+        };
+        assert!(!log_file_path.exists());
+
+        for i in 45..100 {
+            let key = Bytes::from(format!("key{:03}", i));
+            db.view(|txn| {
+                let item = txn.get(&key).unwrap();
+                let val = item.value();
+                assert_eq!(val.len(), sz);
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_value_gc2() {
+        let dir = tempdir::TempDir::new("gc-test").unwrap();
+        let mut opts = AgateOptions::default_for_test(dir.path());
+        opts.value_log_file_size = 1 << 20;
+        opts.base_table_size = 1 << 15;
+        opts.value_threshold = 1 << 10;
+
+        let db = opts.open().unwrap();
+
+        let sz = 32 << 10;
+        let mut txn = db.new_transaction(true);
+        for i in 0..100 {
+            let val = Alphanumeric.sample_string(&mut rand::thread_rng(), sz);
+            txn.set_entry(Entry::new(
+                Bytes::from(format!("key{:03}", i)),
+                Bytes::from(val),
+            ))
+            .unwrap();
+            if i % 20 == 0 {
+                txn.commit().unwrap();
+                txn = db.new_transaction(true);
+            }
+        }
+        txn.commit().unwrap();
+
+        for i in 0..5 {
+            txn_delete(&db, Bytes::from(format!("key{:03}", i)));
+        }
+
+        for i in 5..10 {
+            txn_set(
+                &db,
+                Bytes::from(format!("key{:03}", i)),
+                Bytes::from(format!("value{:03}", i)),
+                0,
+            );
+        }
+
+        let log_file_path = {
+            let log_file = db.core.value_log().get_log_file(1).unwrap();
+            let log_file_gaurd = log_file.read().unwrap();
+            let path = log_file_gaurd.file_path().to_owned();
+
+            db.core.rewrite(&log_file_gaurd).unwrap();
+            path
+        };
+        assert!(!log_file_path.exists());
+
+        for i in 0..5 {
+            let key = Bytes::from(format!("key{:03}", i));
+            db.view(|txn| {
+                match txn.get(&key) {
+                    Err(Error::KeyNotFound(_)) => {}
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        for i in 5..10 {
+            let key = Bytes::from(format!("key{:03}", i));
+            db.view(|txn| {
+                let item = txn.get(&key).unwrap();
+                let val = item.value();
+                assert_eq!(val, Bytes::from(format!("value{:03}", i)));
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        // Moved entries.
+        for i in 10..100 {
+            let key = Bytes::from(format!("key{:03}", i));
+            db.view(|txn| {
+                let item = txn.get(&key).unwrap();
+                let val = item.value();
+                assert_eq!(val.len(), sz);
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    // discard stats
+}

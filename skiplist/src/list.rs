@@ -205,9 +205,8 @@ impl<C: KeyComparator> Skiplist<C> {
             next[i] = n;
             if p == n {
                 unsafe {
-                    if (*p).value != value {
-                        return Some((key, value));
-                    }
+                    // overwrite the value
+                    (*p).value = value;
                 }
                 return None;
             }

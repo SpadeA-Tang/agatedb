@@ -18,6 +18,7 @@ mod memtable;
 mod ops;
 pub mod opt;
 mod table;
+mod test_tuil;
 pub mod util;
 mod value;
 mod value_log;
