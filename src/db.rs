@@ -5,7 +5,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, RwLock, RwLockReadGuard,
     },
     thread::JoinHandle,
@@ -60,6 +60,8 @@ pub struct Core {
     is_closed: AtomicBool,
 
     pub(crate) orc: Arc<Oracle>,
+
+    gc_running: AtomicBool,
 }
 
 pub struct Agate {
@@ -188,6 +190,7 @@ impl Core {
             block_writes: AtomicBool::new(false),
             is_closed: AtomicBool::new(false),
             orc,
+            gc_running: AtomicBool::default(),
         };
 
         core.orc.init_next_ts(core.max_version());
@@ -657,6 +660,10 @@ impl Core {
         unreachable!()
     }
 
+    pub(crate) fn value_log(&self) -> &ValueLog {
+        self.vlog.as_ref().as_ref().unwrap()
+    }
+
     // Triggers a value log garbage collection.
     //
     // It picks value log files to perform GC based on statistics that are collected
@@ -692,18 +699,40 @@ impl Core {
             return Err(Error::ErrInvalidRequest);
         }
 
-        self.vlog.as_ref().as_ref().unwrap().run_gc(discard_ratio)
+        self.run_gc(discard_ratio)
+    }
+
+    fn run_gc(&self, discard_ratio: f64) -> Result<()> {
+        // spadea(todo): downgrade ordering
+        let _ = self
+            .gc_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| Error::ErrRejected)?;
+
+        let lf = self
+            .value_log()
+            .pick_log(discard_ratio)
+            .ok_or(Error::ErrNoRewrite)?;
+        let gc_result = self.do_run_gc(lf);
+
+        self.gc_running.store(false, Ordering::SeqCst);
+        gc_result
+    }
+
+    fn do_run_gc(&self, log_file: Arc<RwLock<Wal>>) -> Result<()> {
+        // spadea(todo): port span
+        let log_file = log_file.read().unwrap();
+        let fid = log_file.file_id();
+        self.rewrite(&log_file)?;
+        // Remove the file from discardStats.
+        self.value_log().discard_stats().update(fid, -1);
+        Ok(())
     }
 
     fn rewrite(&self, log_file: &RwLockReadGuard<Wal>) -> Result<()> {
         let mut inner = self.vlog.as_ref().as_ref().unwrap().inner.write().unwrap();
         let fid = log_file.file_id();
-        if inner
-            .files_to_delete
-            .iter()
-            .find(|id| **id == fid)
-            .is_some()
-        {
+        if inner.files_to_delete.iter().any(|id| *id == fid) {
             return Err(Error::Other(format!(
                 "value log file already marked for deletion fid {}",
                 fid
@@ -718,7 +747,7 @@ impl Core {
         let mut size = 0;
         let (mut count, mut moved) = (0, 0);
 
-        let fe = |e: EntryRef| -> Result<()> {
+        let mut fe = |e: EntryRef, wb: &mut Vec<Entry>| -> Result<()> {
             count += 1;
             if count % 100000 == 0 {
                 debug!("Processing entry {:?}", count);
@@ -732,7 +761,7 @@ impl Core {
 
             // Value is still present in value log
 
-            if val.value.len() == 0 {
+            if val.value.is_empty() {
                 return Err(Error::Other(format!("Empty value {:?}", val)));
             }
 
@@ -760,7 +789,7 @@ impl Core {
                 moved += 1;
                 let mut new_entry = e.to_owned();
                 new_entry.meta = e.meta & (!(VALUE_POINTER | VALUE_TXN | VALUE_FIN_TXN));
-                let es = new_entry.estimate_size(self.opts.value_threshold);
+                let mut es = new_entry.estimate_size(self.opts.value_threshold);
                 // Consider size of value as well while considering the total size
                 // of the batch. There have been reports of high memory usage in
                 // rewrite because we don't consider the value size. See #1292.
@@ -770,9 +799,9 @@ impl Core {
                 if wb.len() + 1 >= self.opts.max_batch_count as usize
                     || size + es > self.opts.max_batch_size as usize
                 {
-                    self.batch_set(wb)?;
+                    self.batch_set(std::mem::take(wb))?;
                     size = 0;
-                    wb.clear();
+                    *wb = Vec::with_capacity(1000);
                 }
 
                 wb.push(new_entry);
@@ -835,7 +864,7 @@ impl Core {
 
         let mut iter = log_file.iter().unwrap();
         while let Some(e) = iter.next()? {
-            fe(e)?;
+            fe(e, &mut wb)?;
         }
 
         let mut batch_size = 1024;
@@ -851,7 +880,7 @@ impl Core {
             let end = usize::min(i + batch_size, wb.len());
             match self.batch_set(wb[i..end].to_vec()) {
                 Err(Error::TxnTooBig) => {
-                    batch_size = batch_size / 2;
+                    batch_size /= 2;
                     continue;
                 }
                 e @ Err(_) => return e,
@@ -909,7 +938,8 @@ fn discard_entry(e: &EntryRef, val: &Value) -> bool {
         // Just a txn finish entry. Discard.
         return true;
     }
-    return false;
+
+    false
 }
 
 #[cfg(test)]

@@ -5,8 +5,8 @@ use std::{
     os::unix::prelude::MetadataExt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, RwLock, RwLockReadGuard,
+        atomic::{AtomicBool, AtomicU32},
+        Arc, RwLock,
     },
 };
 
@@ -15,7 +15,6 @@ use log::{debug, error, info};
 
 use crate::{
     discard::DiscardStats,
-    entry::Entry,
     error,
     value::{self, Request, ValuePointer},
     wal::{Header, Wal},
@@ -26,7 +25,7 @@ fn vlog_file_path(dir: impl AsRef<Path>, fid: u32) -> PathBuf {
     dir.as_ref().join(format!("{:06}.vlog", fid))
 }
 
-struct ValueLogInner {
+pub(crate) struct ValueLogInner {
     /// `files_map` stores mapping from value log ID to WAL object.
     ///
     /// As we would concurrently read WAL, we need to wrap it with `RwLock`.
@@ -361,21 +360,11 @@ impl ValueLog {
         Ok(original_buf)
     }
 
-    pub(crate) fn run_gc(&self, discard_ratio: f64) -> Result<()> {
-        // spadea(todo): downgrade ordering
-        let _ = self
-            .gc_running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .map_err(|_| Error::ErrRejected)?;
-
-        let lf = self.pick_log(discard_ratio).ok_or(Error::ErrNoRewrite)?;
-        let gc_result = self.do_run_gc(lf);
-
-        self.gc_running.store(false, Ordering::SeqCst);
-        gc_result
+    pub(crate) fn get_log_file(&self, fid: u32) -> Option<Arc<RwLock<Wal>>> {
+        self.inner.read().unwrap().files_map.get(&fid).cloned()
     }
 
-    fn pick_log(&self, discard_ratio: f64) -> Option<Arc<RwLock<Wal>>> {
+    pub(crate) fn pick_log(&self, discard_ratio: f64) -> Option<Arc<RwLock<Wal>>> {
         let inner = self.inner.read().unwrap();
 
         loop {
@@ -433,43 +422,15 @@ impl ValueLog {
         }
     }
 
-    fn do_run_gc(&self, log_file: Arc<RwLock<Wal>>) -> Result<()> {
-        // spadea(todo): port span
-        let log_file = log_file.read().unwrap();
-        let fid = log_file.file_id();
-        self.rewrite(&log_file)?;
-        // Remove the file from discardStats.
-        self.discard_stats.update(fid, -1);
-        Ok(())
-    }
-
-    fn rewrite(&self, log_file: &RwLockReadGuard<Wal>) -> Result<()> {
-        let mut inner = self.inner.write().unwrap();
-        let fid = log_file.file_id();
-        if inner
-            .files_to_delete
-            .iter()
-            .find(|id| **id == fid)
-            .is_some()
-        {
-            return Err(Error::Other(format!(
-                "value log file already marked for deletion fid {}",
-                fid
-            )));
-        }
-
-        let max_fid = inner.max_fid;
-        assert!(fid < max_fid);
-
-        info!("Rewriting fid: {}", fid);
-        let mut wb: Vec<Entry> = Vec::with_capacity(1000);
-        let mut size = 0;
-
-        Ok(())
-    }
-
     pub(crate) fn discard_stats(&self) -> &DiscardStats {
         &self.discard_stats
+    }
+
+    pub(crate) fn delete_log_file(&self, log_file: Arc<RwLock<Wal>>) -> Result<()> {
+        self.discard_stats
+            .update(log_file.read().unwrap().file_id(), -1);
+
+        Ok(())
     }
 }
 
@@ -491,12 +452,31 @@ impl DerefMut for ValueLogWrapper {
 
 impl Drop for ValueLogWrapper {
     fn drop(&mut self) {
+        if self.0.as_ref().is_none() {
+            return;
+        }
         // it is last second one (the last is hold by db)
+        println!("{}", Arc::strong_count(&self.0));
         if Arc::strong_count(&self.0) > 2 {
             return;
         }
 
-        unimplemented!()
+        let mut log_files = vec![];
+        {
+            let mut inner = self.0.as_ref().as_ref().unwrap().inner.write().unwrap();
+            let files_to_delete = std::mem::take(&mut inner.files_to_delete);
+            for fid in files_to_delete {
+                log_files.push(inner.files_map.remove(&fid).unwrap());
+            }
+        }
+
+        for log_file in log_files {
+            self.as_ref()
+                .as_ref()
+                .unwrap()
+                .delete_log_file(log_file)
+                .unwrap();
+        }
     }
 }
 

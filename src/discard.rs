@@ -215,7 +215,7 @@ mod test {
         assert_eq!(fid, 0);
 
         for i in 0..20 {
-            assert_eq!(i * 100, ds.update(i, (i * 100) as isize));
+            assert_eq!(i * 100, ds.update(i, (i * 100) as isize) as u32);
         }
         ds.iterate(|id, val| {
             assert_eq!(id * 100, val);

@@ -82,7 +82,7 @@ impl Item {
 
         let mut vptr = ValuePointer::default();
         vptr.decode(&self.vptr);
-        let vlog = (*self.core.vlog).as_ref().unwrap();
+        let vlog = (**self.core.vlog).as_ref().unwrap();
         let raw_buffer = vlog.read(vptr);
         if let Ok(mut raw_buffer) = raw_buffer {
             let entry = Wal::decode_entry(&mut raw_buffer).unwrap();
