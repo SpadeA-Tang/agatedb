@@ -415,8 +415,8 @@ mod tests {
         let mut buf1 = vlog.read(req.ptrs[0].clone()).unwrap();
         let mut buf2 = vlog.read(req.ptrs[1].clone()).unwrap();
 
-        let e1 = Wal::decode_entry(&mut buf1, req.ptrs[0].offset).unwrap();
-        let e2 = Wal::decode_entry(&mut buf2, req.ptrs[1].offset).unwrap();
+        let e1 = Wal::decode_entry(&mut buf1).unwrap();
+        let e2 = Wal::decode_entry(&mut buf2).unwrap();
 
         assert_eq!(&e1.key[..], b"samplekey");
         assert_eq!(&e1.value[..], val1);

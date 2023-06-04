@@ -10,7 +10,6 @@ pub struct Entry {
     pub user_meta: u8,
     pub expires_at: u64,
     pub(crate) version: u64,
-    pub(crate) offset: u32,
 }
 
 pub struct EntryRef<'a> {
@@ -38,7 +37,6 @@ impl Entry {
             user_meta: 0,
             expires_at: 0,
             version: 0,
-            offset: 0,
         }
     }
 

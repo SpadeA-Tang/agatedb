@@ -198,7 +198,7 @@ impl Wal {
     }
 
     /// Decode entry from buffer
-    pub(crate) fn decode_entry(buf: &mut Bytes, offset: u32) -> Result<Entry> {
+    pub(crate) fn decode_entry(buf: &mut Bytes) -> Result<Entry> {
         let mut header = Header::default();
         header.decode(buf)?;
         let kv = buf;
@@ -211,7 +211,6 @@ impl Wal {
                 header.key_len as usize..header.key_len as usize + header.value_len as usize,
             ),
             version: 0,
-            offset,
         })
     }
 

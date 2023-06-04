@@ -81,7 +81,6 @@ impl MemTable {
                 version: value.version,
                 user_meta: value.user_meta,
                 meta: value.meta,
-                offset: 0, // not used in encoding
             };
             // If WAL exceeds opt.value_log_file_size, we'll force flush the memtable.
             wal.write_entry(&entry)?;
