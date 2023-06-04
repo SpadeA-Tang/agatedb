@@ -10,6 +10,7 @@ pub struct Entry {
     pub user_meta: u8,
     pub expires_at: u64,
     pub(crate) version: u64,
+    pub(crate) offset: u32,
 }
 
 pub struct EntryRef<'a> {
@@ -19,6 +20,7 @@ pub struct EntryRef<'a> {
     pub user_meta: u8,
     pub expires_at: u64,
     pub(crate) version: u64,
+    pub(crate) offset: u32,
 }
 
 impl<'a> EntryRef<'a> {
@@ -36,6 +38,7 @@ impl Entry {
             user_meta: 0,
             expires_at: 0,
             version: 0,
+            offset: 0,
         }
     }
 
@@ -88,4 +91,70 @@ impl Entry {
             bytes.advance_mut(encoded_len);
         }
     }*/
+}
+
+#[cfg(test)]
+mod test {
+    use tempfile::tempdir;
+
+    use crate::{
+        value::{Request, VALUE_POINTER},
+        value_log::ValueLog,
+        AgateOptions,
+    };
+
+    use super::*;
+
+    #[test]
+    fn test_entry_offset() {
+        let mut opts = AgateOptions::default();
+        let tmp_dir = tempdir().unwrap();
+        opts.value_dir = tmp_dir.path().to_path_buf();
+        opts.value_threshold = 32;
+        opts.value_log_file_size = 1024;
+        let vlog = ValueLog::new(opts.clone()).unwrap().unwrap();
+
+        let val1 = b"sampleval012345678901234567890123";
+        let val2 = b"samplevalb012345678901234567890123";
+        let val3 = b"samplevalb01234567890123456789012345";
+        let val4 = b"samplevalb012345678321123124141241213123";
+
+        let mut e1 = Entry::new(
+            Bytes::from_static(b"samplekey"),
+            Bytes::copy_from_slice(val1),
+        );
+        e1.meta = VALUE_POINTER;
+        let mut e2 = Entry::new(
+            Bytes::from_static(b"samplekeyb"),
+            Bytes::copy_from_slice(val2),
+        );
+        e2.meta = VALUE_POINTER;
+        let mut e3 = Entry::new(
+            Bytes::from_static(b"samplekeyc"),
+            Bytes::copy_from_slice(val3),
+        );
+        e3.meta = VALUE_POINTER;
+        let mut e4 = Entry::new(
+            Bytes::from_static(b"samplekeyd"),
+            Bytes::copy_from_slice(val4),
+        );
+        e4.meta = VALUE_POINTER;
+
+        let mut reqs = vec![Request {
+            entries: vec![e1, e2, e3, e4],
+            ptrs: vec![],
+            done: None,
+        }];
+        vlog.write(&mut reqs).unwrap();
+
+        let log_file = vlog.get_log_file(1).unwrap();
+        let log_file = log_file.read().unwrap();
+        let mut iter = log_file.iter().unwrap();
+
+        let mut i = 0;
+        while let Ok(Some(e)) = iter.next() {
+            assert_eq!(e.offset, reqs[0].ptrs[i].offset);
+            i += 1;
+        }
+    }
 }

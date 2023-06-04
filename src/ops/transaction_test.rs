@@ -777,6 +777,7 @@ mod normal_db {
                         user_meta: 0,
                         expires_at: 0,
                         version: 0,
+                        offset: 0,
                     };
                     agate
                         .core
