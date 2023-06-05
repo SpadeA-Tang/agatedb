@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use bytes::{Bytes, BytesMut};
+use rand::distributions::{Alphanumeric, DistString};
 use tempdir::TempDir;
 use tempfile::tempdir;
 
@@ -8,6 +9,8 @@ use super::*;
 use crate::{
     entry::Entry,
     format::{append_ts, key_with_ts},
+    test_tuil::{txn_delete, txn_set},
+    IteratorOptions,
 };
 
 #[test]
@@ -212,4 +215,300 @@ fn test_flush_l1() {
         }
         verify_requests(10000, &agate);
     });
+}
+
+#[test]
+fn test_value_gc() {
+    let dir = tempdir::TempDir::new("gc-test").unwrap();
+    let mut opts = AgateOptions::default_for_test(dir.path());
+    opts.value_log_file_size = 1 << 20;
+    opts.base_table_size = 1 << 15;
+    opts.value_threshold = 1 << 10;
+
+    let db = opts.open().unwrap();
+
+    let sz = 32 << 10;
+    let mut txn = db.new_transaction(true);
+    for i in 0..100 {
+        let val = Alphanumeric.sample_string(&mut rand::thread_rng(), sz);
+        txn.set_entry(Entry::new(
+            Bytes::from(format!("key{:03}", i)),
+            Bytes::from(val),
+        ))
+        .unwrap();
+        if i % 20 == 0 {
+            txn.commit().unwrap();
+            txn = db.new_transaction(true);
+        }
+    }
+    txn.commit().unwrap();
+
+    for i in 0..45 {
+        txn_delete(&db, Bytes::from(format!("key{:03}", i)));
+    }
+
+    let log_file_path = {
+        let log_file = db.core.value_log().get_log_file(1).unwrap();
+        let log_file_gaurd = log_file.read().unwrap();
+        let path = log_file_gaurd.file_path().to_owned();
+
+        db.core.rewrite(&log_file_gaurd).unwrap();
+        path
+    };
+    assert!(!log_file_path.exists());
+
+    for i in 45..100 {
+        let key = Bytes::from(format!("key{:03}", i));
+        db.view(|txn| {
+            let item = txn.get(&key).unwrap();
+            let val = item.value();
+            assert_eq!(val.len(), sz);
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn test_value_gc2() {
+    let dir = tempdir::TempDir::new("gc-test").unwrap();
+    let mut opts = AgateOptions::default_for_test(dir.path());
+    opts.value_log_file_size = 1 << 20;
+    opts.base_table_size = 1 << 15;
+    opts.value_threshold = 1 << 10;
+
+    let db = opts.open().unwrap();
+
+    let sz = 32 << 10;
+    let mut txn = db.new_transaction(true);
+    for i in 0..100 {
+        let val = Alphanumeric.sample_string(&mut rand::thread_rng(), sz);
+        txn.set_entry(Entry::new(
+            Bytes::from(format!("key{:03}", i)),
+            Bytes::from(val),
+        ))
+        .unwrap();
+        if i % 20 == 0 {
+            txn.commit().unwrap();
+            txn = db.new_transaction(true);
+        }
+    }
+    txn.commit().unwrap();
+
+    for i in 0..5 {
+        txn_delete(&db, Bytes::from(format!("key{:03}", i)));
+    }
+
+    for i in 5..10 {
+        txn_set(
+            &db,
+            Bytes::from(format!("key{:03}", i)),
+            Bytes::from(format!("value{:03}", i)),
+            0,
+        );
+    }
+
+    let log_file_path = {
+        let log_file = db.core.value_log().get_log_file(1).unwrap();
+        let log_file_gaurd = log_file.read().unwrap();
+        let path = log_file_gaurd.file_path().to_owned();
+
+        db.core.rewrite(&log_file_gaurd).unwrap();
+        path
+    };
+    assert!(!log_file_path.exists());
+
+    for i in 0..5 {
+        let key = Bytes::from(format!("key{:03}", i));
+        db.view(|txn| {
+            match txn.get(&key) {
+                Err(Error::KeyNotFound(_)) => {}
+                _ => unreachable!(),
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    for i in 5..10 {
+        let key = Bytes::from(format!("key{:03}", i));
+        db.view(|txn| {
+            let item = txn.get(&key).unwrap();
+            let val = item.value();
+            assert_eq!(val, Bytes::from(format!("value{:03}", i)));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // Moved entries.
+    for i in 10..100 {
+        let key = Bytes::from(format!("key{:03}", i));
+        db.view(|txn| {
+            let item = txn.get(&key).unwrap();
+            let val = item.value();
+            assert_eq!(val.len(), sz);
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn test_value_gc3() {
+    let dir = tempdir::TempDir::new("gc-test").unwrap();
+    let mut opts = AgateOptions::default_for_test(dir.path());
+    opts.value_log_file_size = 1 << 20;
+    opts.base_table_size = 1 << 15;
+    opts.value_threshold = 1 << 10;
+
+    let db = opts.open().unwrap();
+
+    let sz = 32 << 10;
+    let mut txn = db.new_transaction(true);
+    let mut value3 = None;
+    for i in 0..100 {
+        let val = Alphanumeric.sample_string(&mut rand::thread_rng(), sz);
+        if i == 3 {
+            value3 = Some(val.clone());
+        }
+        txn.set_entry(Entry::new(
+            Bytes::from(format!("key{:03}", i)),
+            Bytes::from(val),
+        ))
+        .unwrap();
+        if i % 20 == 0 {
+            txn.commit().unwrap();
+            txn = db.new_transaction(true);
+        }
+    }
+    txn.commit().unwrap();
+
+    let it_opts = IteratorOptions {
+        prefetch_values: false,
+        prefetch_size: 0,
+        reverse: false,
+        ..Default::default()
+    };
+    let txn = db.new_transaction(true);
+    let mut iter = txn.new_iterator(&it_opts);
+
+    iter.rewind();
+    assert!(iter.valid());
+    let mut item = iter.item();
+    assert_eq!(Bytes::from("key000"), item.key);
+
+    iter.next();
+    assert!(iter.valid());
+    item = iter.item();
+    assert_eq!(Bytes::from("key001"), item.key);
+
+    iter.next();
+    assert!(iter.valid());
+    item = iter.item();
+    assert_eq!(Bytes::from("key002"), item.key);
+
+    // Like other tests, we pull out a logFile to rewrite it directly
+
+    let log_file_path = {
+        let log_file = db.core.value_log().get_log_file(1).unwrap();
+        let log_file_gaurd = log_file.read().unwrap();
+        let path = log_file_gaurd.file_path().to_owned();
+
+        db.core.rewrite(&log_file_gaurd).unwrap();
+        path
+    };
+    // the log file shoud exist as txn iterator is not released
+    assert!(log_file_path.exists());
+
+    iter.next();
+    assert!(iter.valid());
+    item = iter.item();
+    assert_eq!(Bytes::from("key003"), item.key);
+    let val = item.value();
+    assert_eq!(val, value3.unwrap());
+
+    drop(iter);
+    // now the log file shoud be deleted
+    assert!(!log_file_path.exists());
+}
+
+#[test]
+fn test_value_gc4() {
+    let dir = tempdir::TempDir::new("gc-test").unwrap();
+    let mut opts = AgateOptions::default_for_test(dir.path());
+    opts.value_log_file_size = 1 << 20;
+    opts.base_table_size = 1 << 15;
+    opts.value_threshold = 1 << 10;
+
+    let db = opts.open().unwrap();
+
+    let sz = 128 << 10;
+    let mut txn = db.new_transaction(true);
+    for i in 0..24 {
+        let val = Alphanumeric.sample_string(&mut rand::thread_rng(), sz);
+        txn.set_entry(Entry::new(
+            Bytes::from(format!("key{:03}", i)),
+            Bytes::from(val),
+        ))
+        .unwrap();
+        if i % 3 == 0 {
+            txn.commit().unwrap();
+            txn = db.new_transaction(true);
+        }
+    }
+    txn.commit().unwrap();
+
+    for i in 0..8 {
+        txn_delete(&db, Bytes::from(format!("key{:03}", i)));
+    }
+
+    for i in 8..16 {
+        txn_set(
+            &db,
+            Bytes::from(format!("key{:03}", i)),
+            Bytes::from(format!("value{:03}", i)),
+            0,
+        );
+    }
+
+    let (log_file_path, log_file_path2) = {
+        let log_file = db.core.value_log().get_log_file(1).unwrap();
+        let log_file_gaurd = log_file.read().unwrap();
+        let path = log_file_gaurd.file_path().to_owned();
+        db.core.rewrite(&log_file_gaurd).unwrap();
+
+        let log_file = db.core.value_log().get_log_file(2).unwrap();
+        let log_file_gaurd = log_file.read().unwrap();
+        let path2 = log_file_gaurd.file_path().to_owned();
+        db.core.rewrite(&log_file_gaurd).unwrap();
+
+        (path, path2)
+    };
+    assert!(!log_file_path.exists());
+    assert!(!log_file_path2.exists());
+    drop(db);
+
+    let db = opts.open().unwrap();
+    for i in 0..8 {
+        let key = Bytes::from(format!("key{:03}", i));
+        db.view(|txn| {
+            match txn.get(&key) {
+                Err(Error::KeyNotFound(_)) => {}
+                _ => unreachable!(),
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    for i in 8..16 {
+        let key = Bytes::from(format!("key{:03}", i));
+        db.view(|txn| {
+            let item = txn.get(&key).unwrap();
+            let val = item.value();
+            assert_eq!(val, Bytes::from(format!("value{:03}", i)));
+            Ok(())
+        })
+        .unwrap();
+    }
 }
