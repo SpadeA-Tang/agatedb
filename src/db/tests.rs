@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use bytes::{Bytes, BytesMut};
+use rand::distributions::{Alphanumeric, DistString};
 use tempdir::TempDir;
 use tempfile::tempdir;
 
@@ -212,4 +213,55 @@ fn test_flush_l1() {
         }
         verify_requests(10000, &agate);
     });
+}
+
+#[test]
+fn test_db_growth() {
+    let dir = tempdir::TempDir::new("gc-test").unwrap();
+
+    let mut start = 0;
+    let mut last_start = 0;
+    let num_keys = 2000;
+    let value_size = 1024;
+    let value = Bytes::from(Alphanumeric.sample_string(&mut rand::thread_rng(), value_size));
+
+    let discard_ratio = 0.001;
+    let max_writes = 200;
+    let opts = AgateOptions::default_for_test(dir);
+    opts.value_log_file_size = 64 << 15;
+    opts.base_table_size = 4 << 15;
+    opts.base_level_size = 16 << 15;
+    opts.num_versions_to_keep = 1;
+    opts.num_level_zero_tables = 1;
+    opts.num_level_zero_tables_stall = 2;
+    let db = opts.open().unwrap();
+    for num_writes in 0..max_writes {
+        let mut txn = db.new_transaction(true);
+        if start > 0 {
+            for i in last_start..start {
+                let key = Bytes::from(format!("{:?}", i));
+                match txn.delete(key) {
+                    Err(Error::TxnTooBig) => {
+                        txn.commit().unwrap();
+                        txn = db.new_transaction(true);
+                    }
+                    Err(_) => unreachable!(),
+                    _ => {}
+                }
+            }
+        }
+
+        for i in start..start + num_keys {
+            let key = Bytes::from(format!("{:?}", i));
+            match txn.set_entry(Entry::new(key, value.clone())) {
+                Err(Error::TxnTooBig) => {
+                    txn.commit().unwrap();
+                    txn = db.new_transaction(true);
+                }
+                Err(_) => unreachable!(),
+                _ => {}
+            }
+        }
+        txn.commit().unwrap();
+    }
 }

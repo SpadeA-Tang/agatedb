@@ -243,6 +243,7 @@ impl AgateOptions {
         AgateOptions {
             dir: PathBuf::from(dir),
             value_dir: PathBuf::from(dir),
+            sync_writes: false,
             ..Default::default()
         }
     }

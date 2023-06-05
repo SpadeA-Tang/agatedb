@@ -6,13 +6,15 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, RwLock, RwLockReadGuard,
+        mpsc::sync_channel,
+        Arc, Mutex, RwLock, RwLockReadGuard,
     },
     thread::JoinHandle,
 };
 
 use bytes::{Bytes, BytesMut};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
+use human_bytes::human_bytes;
 use log::{debug, info, warn};
 pub use opt::AgateOptions;
 use skiplist::Skiplist;
@@ -23,7 +25,7 @@ use crate::{
     entry::{Entry, EntryRef},
     get_ts,
     iterator::is_deleted_or_expired,
-    levels::LevelsController,
+    levels::{CompactionPriority, LevelsController},
     manifest::ManifestFile,
     memtable::{MemTable, MemTables},
     ops::oracle::Oracle,
@@ -144,6 +146,95 @@ impl Agate {
 
     pub fn write_requests(&self, request: Vec<Request>) -> Result<()> {
         self.core.write_requests(request)
+    }
+
+    // Flatten can be used to force compactions on the LSM tree so all the tables fall on the same
+    // level. This ensures that all the versions of keys are colocated and not split across multiple
+    // levels, which is necessary after a restore from backup. During Flatten, live compactions are
+    // stopped. Ideally, no writes are going on during Flatten. Otherwise, it would create competition
+    // between flattening the tree and new tables being created at level zero.
+    pub fn flatten(&self, workers: u64) -> Result<()> {
+        self.core.stop_compaction();
+
+        let compact_away = |cp: CompactionPriority| -> Result<()> {
+            info!("Attempting to compact with {:?}", cp);
+            let (tx, rx) = sync_channel(1);
+            let tx = Arc::new(Mutex::new(tx));
+
+            let mut handles = vec![];
+            for _ in 0..workers {
+                let tx_clone = tx.clone();
+                let core = self.core.clone();
+                let pool_clone = self.pool.clone();
+                let cp_clone = cp.clone();
+                handles.push(std::thread::spawn(move || {
+                    tx_clone
+                        .lock()
+                        .unwrap()
+                        .send(core.lvctl.inner.do_compact(175, cp_clone, pool_clone))
+                        .unwrap();
+                }));
+            }
+
+            let mut success = 0;
+            let mut rerr = None;
+            for _ in 0..workers {
+                match rx.recv().unwrap() {
+                    Err(e) => {
+                        warn!("While running doCompact with {:?}. Error: {:?}", cp, e);
+                        rerr = Some(e);
+                    }
+                    Ok(_) => success += 1,
+                }
+            }
+            if success == 0 {
+                return Err(rerr.unwrap());
+            }
+
+            info!(
+                "{} compactor(s) succeeded. One or more tables from level {} compacted.",
+                success, cp.level
+            );
+
+            Ok(())
+        };
+
+        let hbytes = |sz| -> String { human_bytes(sz as f64) };
+
+        let t = self.core.lvctl.inner.level_targets();
+        loop {
+            info!("");
+            let mut levels = vec![];
+            for (i, l) in self.core.lvctl.inner.levels.iter().enumerate() {
+                let sz = l.read().unwrap().total_size;
+                info!(
+                    "Level: {}. {} Size. {} Max.",
+                    i,
+                    hbytes(sz),
+                    hbytes(t.target_size[i])
+                );
+                if sz > 0 {
+                    levels.push(i);
+                }
+            }
+            if levels.len() <= 1 {
+                let prios = self.core.lvctl.inner.pick_compact_levels();
+                if prios.len() == 0 || prios[0].score < 1.0 {
+                    info!("All tables consolidated into one level. Flattening done.");
+                    return Ok(());
+                }
+                compact_away(prios[0].clone())?;
+                continue;
+            }
+
+            // Create an artificial compaction priority, to ensure that we compact the level.
+            let cp = CompactionPriority {
+                level: levels[0],
+                score: 1.71,
+                ..Default::default()
+            };
+            compact_away(cp)?;
+        }
     }
 }
 
@@ -919,6 +1010,14 @@ impl Core {
         let done = self.send_to_write_channel(entries)?;
         done.recv().unwrap()
     }
+
+    fn stop_compaction(&self) {
+        unimplemented!()
+    }
+
+    fn start_compaction(&self) {
+        unimplemented!()
+    }
 }
 
 fn discard_entry(e: &EntryRef, val: &Value) -> bool {
@@ -950,13 +1049,13 @@ pub(crate) mod tests;
 #[cfg(test)]
 mod test {
 
+    use rand::distributions::{Alphanumeric, DistString};
+
+    use super::*;
     use crate::{
         test_tuil::{txn_delete, txn_set},
         IteratorOptions,
     };
-
-    use super::*;
-    use rand::distributions::{Alphanumeric, DistString};
 
     #[test]
     fn test_value_gc() {

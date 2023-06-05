@@ -30,6 +30,7 @@ skiplist = { path = "skiplist" }
 tempdir = "0.3"
 thiserror = "1.0"
 yatp = { git = "https://github.com/tikv/yatp.git", rev = "b793461ea4abd202798cda6e20e97a054103f2ad" }
+human_bytes = "0.4.2"
 
 [dev-dependencies]
 criterion = "0.3"

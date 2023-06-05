@@ -1,5 +1,7 @@
 mod compaction;
 mod handler;
+
+pub(crate) use compaction::CompactionPriority;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -13,8 +15,8 @@ use std::{
 
 use bytes::{BufMut, Bytes, BytesMut};
 use compaction::{
-    get_key_range, get_key_range_single, CompactDef, CompactStatus, CompactionPriority, KeyRange,
-    LevelCompactStatus, Targets,
+    get_key_range, get_key_range_single, CompactDef, CompactStatus, KeyRange, LevelCompactStatus,
+    Targets,
 };
 use crossbeam_channel::{select, tick, unbounded};
 use handler::LevelHandler;
@@ -116,7 +118,7 @@ impl LevelsControllerInner {
     }
 
     /// Calculates the [`Targets`] for levels in the LSM tree.
-    fn level_targets(&self) -> Targets {
+    pub(crate) fn level_targets(&self) -> Targets {
         let adjust = |size| {
             if size < self.opts.base_level_size {
                 self.opts.base_level_size
@@ -170,7 +172,7 @@ impl LevelsControllerInner {
     }
 
     /// Determines which level to compact.
-    fn pick_compact_levels(&self) -> Vec<CompactionPriority> {
+    pub(crate) fn pick_compact_levels(&self) -> Vec<CompactionPriority> {
         let targets = self.level_targets();
         let mut prios = vec![];
 
@@ -827,7 +829,7 @@ impl LevelsControllerInner {
     }
 
     // Picks some tables on that level and compact it to next level.
-    fn do_compact(
+    pub(crate) fn do_compact(
         self: &Arc<Self>,
         idx: usize,
         mut cpt_prio: CompactionPriority,
