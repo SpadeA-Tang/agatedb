@@ -12,16 +12,16 @@ use agatedb::{
     ChecksumVerificationMode::NoVerification, IteratorOptions, Table, TableBuilder, Value,
 };
 use bytes::{Bytes, BytesMut};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{
+    distributions::{Alphanumeric, DistString},
+    Rng,
+};
 #[cfg(feature = "enable-rocksdb")]
 use rocksdb::DB;
 use tempdir::TempDir;
 
 pub fn rand_value() -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(32)
-        .collect::<String>()
+    Alphanumeric.sample_string(&mut rand::thread_rng(), 32)
 }
 
 /// TableGuard saves Table and TempDir, so as to ensure
@@ -122,7 +122,7 @@ pub fn agate_populate(
                     let (key, value) = if seq {
                         gen_kv_pair(key, value_size)
                     } else {
-                        gen_kv_pair(rng.gen_range(0, key_nums), value_size)
+                        gen_kv_pair(rng.gen_range(0..key_nums), value_size)
                     };
                     txn.set(key, value).unwrap();
                 });
@@ -149,7 +149,7 @@ pub fn agate_randread(agate: Arc<Agate>, key_nums: u64, chunk_size: u64, value_s
             let txn = agate.new_transaction_at(unix_time(), false);
 
             for _ in range {
-                let (key, _) = gen_kv_pair(rng.gen_range(0, key_nums), value_size);
+                let (key, _) = gen_kv_pair(rng.gen_range(0..key_nums), value_size);
                 match txn.get(&key) {
                     Ok(item) => {
                         assert_eq!(item.value().len(), value_size);
@@ -235,7 +235,7 @@ pub fn rocks_populate(
                     let (key, value) = if seq {
                         gen_kv_pair(key, value_size)
                     } else {
-                        gen_kv_pair(rng.gen_range(0, key_nums), value_size)
+                        gen_kv_pair(rng.gen_range(0..key_nums), value_size)
                     };
                     batch.put(key, value);
                 });
@@ -262,7 +262,7 @@ pub fn rocks_randread(db: Arc<DB>, key_nums: u64, chunk_size: u64, value_size: u
             let range = chunk_start..chunk_start + chunk_size;
 
             for _ in range {
-                let (key, _) = gen_kv_pair(rng.gen_range(0, key_nums), value_size);
+                let (key, _) = gen_kv_pair(rng.gen_range(0..key_nums), value_size);
                 match db.get(key) {
                     Ok(item) => {
                         if item.is_some() {
