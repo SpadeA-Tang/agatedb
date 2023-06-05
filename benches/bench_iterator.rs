@@ -54,7 +54,7 @@ fn bench_iterator(c: &mut Criterion) {
 
     c.bench_function("iterate noprefix single key", |b| {
         let txn = db.new_transaction_at(unix_time(), false);
-        let key_id = thread_rng().gen_range(0, N);
+        let key_id = thread_rng().gen_range(0..N);
         let seek_key = key(key_id);
         let it_opts = agatedb::IteratorOptions {
             all_versions: true,
@@ -106,7 +106,7 @@ fn bench_merge_iterator(c: &mut Criterion) {
     c.bench_function("merge iterator random read", |b| {
         b.iter_batched(
             || {
-                let i = rng.gen_range(0, n);
+                let i = rng.gen_range(0..n);
                 (
                     Bytes::from(format!("{:016x}", i)),
                     Bytes::from(i.to_string()),
@@ -145,7 +145,7 @@ fn bench_concat_iterator(c: &mut Criterion) {
     c.bench_function("concat iterator random read", |b| {
         b.iter_batched(
             || {
-                let i = rng.gen_range(0, n);
+                let i = rng.gen_range(0..n);
                 (
                     Bytes::from(format!("{:016x}", i)),
                     Bytes::from(i.to_string()),

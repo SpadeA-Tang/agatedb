@@ -13,7 +13,7 @@ agatedb = { path = "../" }
 bytes = "1.0"
 clap = "2.33"
 indicatif = "0.15"
-rand = "0.7"
+rand = "0.8.4"
 rocksdb = { version = "0.15", optional = true }
 tempdir = "0.3"
 threadpool = "1.8"
