@@ -31,10 +31,10 @@ pub(crate) struct ValueLogInner {
     /// As we would concurrently read WAL, we need to wrap it with `RwLock`.
     /// TODO: use scheme like memtable to separate current vLog
     /// and previous logs, so as to reduce usage of `RwLock`.
-    pub(crate) files_map: HashMap<u32, Arc<RwLock<Wal>>>,
+    files_map: HashMap<u32, Arc<RwLock<Wal>>>,
     /// maximum file ID opened
-    pub(crate) max_fid: u32,
-    pub(crate) files_to_delete: Vec<u32>,
+    max_fid: u32,
+    files_to_delete: Vec<u32>,
     num_entries_written: u32,
 }
 
@@ -56,6 +56,26 @@ impl ValueLogInner {
 
         Ok(())
     }
+
+    pub(crate) fn files_map(&self) -> &HashMap<u32, Arc<RwLock<Wal>>> {
+        &self.files_map
+    }
+
+    pub(crate) fn files_map_mut(&mut self) -> &mut HashMap<u32, Arc<RwLock<Wal>>> {
+        &mut self.files_map
+    }
+
+    pub(crate) fn max_fid(&self) -> u32 {
+        self.max_fid
+    }
+
+    pub(crate) fn files_to_delete(&self) -> &Vec<u32> {
+        &self.files_to_delete
+    }
+
+    pub(crate) fn files_to_delete_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.files_to_delete
+    }
 }
 
 impl Drop for ValueLogInner {
@@ -69,7 +89,7 @@ pub struct ValueLog {
     /// value log directory
     dir_path: PathBuf,
     /// value log file mapping, use `RwLock` to support concurrent read
-    pub(crate) inner: Arc<RwLock<ValueLogInner>>,
+    inner: Arc<RwLock<ValueLogInner>>,
     /// offset of next write
     writeable_log_offset: AtomicU32,
     opts: AgateOptions,
@@ -100,6 +120,10 @@ impl ValueLog {
         };
 
         Ok(inner)
+    }
+
+    pub(crate) fn inner(&self) -> &Arc<RwLock<ValueLogInner>> {
+        &self.inner
     }
 
     fn file_path(&self, fid: u32) -> PathBuf {
@@ -425,16 +449,17 @@ impl ValueLog {
     pub(crate) fn discard_stats(&self) -> &DiscardStats {
         &self.discard_stats
     }
-
-    pub(crate) fn delete_log_file(&self, log_file: Arc<RwLock<Wal>>) -> Result<()> {
-        self.discard_stats
-            .update(log_file.read().unwrap().file_id(), -1);
-
-        Ok(())
-    }
 }
 
+#[derive(Clone)]
 pub struct ValueLogWrapper(pub Arc<Option<ValueLog>>);
+
+impl ValueLogWrapper {
+    // for calling this, ValueLog must be some
+    pub(crate) fn value_log(&self) -> &ValueLog {
+        self.0.as_ref().as_ref().unwrap()
+    }
+}
 
 impl Deref for ValueLogWrapper {
     type Target = Arc<Option<ValueLog>>;
@@ -459,21 +484,11 @@ impl Drop for ValueLogWrapper {
             return;
         }
 
-        let mut log_files = vec![];
-        {
-            let mut inner = self.0.as_ref().as_ref().unwrap().inner.write().unwrap();
-            let files_to_delete = std::mem::take(&mut inner.files_to_delete);
-            for fid in files_to_delete {
-                log_files.push(inner.files_map.remove(&fid).unwrap());
-            }
-        }
-
-        for log_file in log_files {
-            self.as_ref()
-                .as_ref()
-                .unwrap()
-                .delete_log_file(log_file)
-                .unwrap();
+        let mut inner = self.0.as_ref().as_ref().unwrap().inner.write().unwrap();
+        let files_to_delete = std::mem::take(&mut inner.files_to_delete);
+        for fid in files_to_delete {
+            inner.files_map.remove(&fid).unwrap();
+            self.value_log().discard_stats().update(fid, -1);
         }
     }
 }

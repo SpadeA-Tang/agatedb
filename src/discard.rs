@@ -239,7 +239,7 @@ mod test {
         let mut opts = AgateOptions::default_for_test(dir.path());
 
         let db = opts.open().unwrap();
-        let ds = db.core.vlog.as_ref().as_ref().unwrap().discard_stats();
+        let ds = db.core.vlog.value_log().discard_stats();
 
         ds.update(1, 1);
         ds.update(2, 1);
@@ -247,7 +247,7 @@ mod test {
         drop(db);
 
         let db = opts.open().unwrap();
-        let ds = db.core.vlog.as_ref().as_ref().unwrap().discard_stats();
+        let ds = db.core.vlog.value_log().discard_stats();
 
         assert_eq!(ds.update(1, 0), 0);
         assert_eq!(ds.update(2, 0), 1);
