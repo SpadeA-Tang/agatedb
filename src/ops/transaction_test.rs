@@ -257,7 +257,7 @@ mod normal_db {
                 let agate = agatedb.clone();
                 pool.spawn(move |_: &mut Handle<'_>| {
                     let mut txn = agate.new_transaction(true);
-                    let delta = rand::thread_rng().gen_range(0, 100);
+                    let delta = rand::thread_rng().gen_range(0..100);
 
                     for i in 0..3 {
                         txn.set_entry(Entry::new(key(i), Bytes::from((100 - delta).to_string())))

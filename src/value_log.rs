@@ -1,11 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
     iter::FromIterator,
+    ops::{Deref, DerefMut},
+    os::unix::prelude::MetadataExt,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicU32, Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU32},
+        Arc, RwLock,
+    },
 };
 
 use bytes::{Bytes, BytesMut};
+use log::{debug, error, info};
 
 use crate::{
     discard::DiscardStats,
@@ -19,7 +25,7 @@ fn vlog_file_path(dir: impl AsRef<Path>, fid: u32) -> PathBuf {
     dir.as_ref().join(format!("{:06}.vlog", fid))
 }
 
-struct ValueLogInner {
+pub(crate) struct ValueLogInner {
     /// `files_map` stores mapping from value log ID to WAL object.
     ///
     /// As we would concurrently read WAL, we need to wrap it with `RwLock`.
@@ -50,6 +56,26 @@ impl ValueLogInner {
 
         Ok(())
     }
+
+    pub(crate) fn files_map(&self) -> &HashMap<u32, Arc<RwLock<Wal>>> {
+        &self.files_map
+    }
+
+    pub(crate) fn files_map_mut(&mut self) -> &mut HashMap<u32, Arc<RwLock<Wal>>> {
+        &mut self.files_map
+    }
+
+    pub(crate) fn max_fid(&self) -> u32 {
+        self.max_fid
+    }
+
+    pub(crate) fn files_to_delete(&self) -> &Vec<u32> {
+        &self.files_to_delete
+    }
+
+    pub(crate) fn files_to_delete_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.files_to_delete
+    }
 }
 
 impl Drop for ValueLogInner {
@@ -68,6 +94,7 @@ pub struct ValueLog {
     writeable_log_offset: AtomicU32,
     opts: AgateOptions,
 
+    gc_running: AtomicBool,
     discard_stats: DiscardStats,
 }
 
@@ -84,6 +111,7 @@ impl ValueLog {
                 dir_path: opts.value_dir.clone(),
                 opts,
                 writeable_log_offset: AtomicU32::new(0),
+                gc_running: AtomicBool::new(false),
             };
 
             // TODO: garbage collection
@@ -92,6 +120,10 @@ impl ValueLog {
         };
 
         Ok(inner)
+    }
+
+    pub(crate) fn inner(&self) -> &Arc<RwLock<ValueLogInner>> {
+        &self.inner
     }
 
     fn file_path(&self, fid: u32) -> PathBuf {
@@ -113,7 +145,7 @@ impl ValueLog {
                         let fid: u32 = filename[..filename.len() - 5].parse().map_err(|err| {
                             Error::InvalidFilename(format!("failed to parse file ID {:?}", err))
                         })?;
-                        let wal = Wal::open(file.path(), self.opts.clone())?;
+                        let wal = Wal::open(fid, file.path(), self.opts.clone())?;
                         let wal = Arc::new(RwLock::new(wal));
                         if inner.files_map.insert(fid, wal).is_some() {
                             return Err(Error::InvalidFilename(format!(
@@ -142,7 +174,7 @@ impl ValueLog {
         let mut inner = self.inner.write().unwrap();
         let fid = inner.max_fid + 1;
         let path = self.file_path(fid);
-        let wal = Wal::open(path, self.opts.clone())?;
+        let wal = Wal::open(fid, path, self.opts.clone())?;
         // TODO: only create new files
         let wal = Arc::new(RwLock::new(wal));
         assert!(inner.files_map.insert(fid, wal.clone()).is_none());
@@ -356,16 +388,108 @@ impl ValueLog {
         self.inner.read().unwrap().files_map.get(&fid).cloned()
     }
 
-    pub(crate) fn run_gc(&self, _discard_ratio: f64) -> Result<()> {
-        unimplemented!()
-    }
+    pub(crate) fn pick_log(&self, discard_ratio: f64) -> Option<Arc<RwLock<Wal>>> {
+        let inner = self.inner.read().unwrap();
 
-    fn pick_log(&self, _discard_ratio: f64) -> Arc<RwLock<Wal>> {
-        unimplemented!()
+        loop {
+            // Pick a candidate that contains the largest amount of discardable data
+            let (fid, discard) = self.discard_stats.max_discard();
+
+            // max_discard will return fid=0 if it doesn't have any discard data. The
+            // vlog files start from 1.
+            if fid == 0 {
+                info!("No file with discard stats");
+            }
+            let lf = match inner.files_map.get(&fid) {
+                Some(lf) => lf.read().unwrap(),
+                None => {
+                    // This file was deleted but it's discard stats increased because of compactions. The file
+                    // doesn't exist so we don't need to do anything. Skip it and retry.
+                    self.discard_stats.update(fid, -1);
+                    continue;
+                }
+            };
+
+            let file_size = match lf.file().metadata() {
+                Ok(meta) => meta.size(),
+                Err(e) => {
+                    error!(
+                        "Unable to get stats for value log fid: {} err: {:?}",
+                        fid, e
+                    );
+                    return None;
+                }
+            };
+
+            let thr = file_size as f64 * discard_ratio;
+            // rust does not support comparison between float
+            if discard < thr as u64 {
+                debug!(
+                    "Discard: {} less than threshold: {} for file: {:?}",
+                    discard,
+                    thr,
+                    lf.file_path()
+                );
+                return None;
+            }
+
+            if fid < inner.max_fid {
+                info!(
+                    "Found value log max discard fid: {} discard: {}",
+                    fid, discard
+                );
+
+                return Some(inner.files_map.get(&fid).unwrap().clone());
+            }
+
+            return None;
+        }
     }
 
     pub(crate) fn discard_stats(&self) -> &DiscardStats {
         &self.discard_stats
+    }
+}
+
+#[derive(Clone)]
+pub struct ValueLogWrapper(pub Arc<Option<ValueLog>>);
+
+impl ValueLogWrapper {
+    // for calling this, ValueLog must be some
+    pub(crate) fn value_log(&self) -> &ValueLog {
+        self.0.as_ref().as_ref().unwrap()
+    }
+}
+
+impl Deref for ValueLogWrapper {
+    type Target = Arc<Option<ValueLog>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ValueLogWrapper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ValueLogWrapper {
+    fn drop(&mut self) {
+        if self.0.as_ref().is_none() {
+            return;
+        }
+        if Arc::strong_count(&self.0) > 2 {
+            return;
+        }
+
+        let mut inner = self.0.as_ref().as_ref().unwrap().inner.write().unwrap();
+        let files_to_delete = std::mem::take(&mut inner.files_to_delete);
+        for fid in files_to_delete {
+            inner.files_map.remove(&fid).unwrap();
+            self.value_log().discard_stats().update(fid, -1);
+        }
     }
 }
 

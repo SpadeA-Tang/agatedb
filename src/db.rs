@@ -5,31 +5,32 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize},
-        Arc, RwLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, RwLock, RwLockReadGuard,
     },
     thread::JoinHandle,
 };
 
 use bytes::{Bytes, BytesMut};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
-use log::{debug, info};
+use log::{debug, info, warn};
 pub use opt::AgateOptions;
 use skiplist::Skiplist;
 use yatp::task::callback::Handle;
 
 use crate::{
     closer::Closer,
-    entry::Entry,
+    entry::{Entry, EntryRef},
     get_ts,
+    iterator::is_deleted_or_expired,
     levels::LevelsController,
     manifest::ManifestFile,
     memtable::{MemTable, MemTables},
     ops::oracle::Oracle,
     opt::build_table_options,
     util::{has_any_prefixes, make_comparator},
-    value::{self, Request, Value, ValuePointer},
-    value_log::ValueLog,
+    value::{self, Request, Value, ValuePointer, VALUE_FIN_TXN, VALUE_POINTER, VALUE_TXN},
+    value_log::{ValueLog, ValueLogWrapper},
     wal::Wal,
     Error, Result, Table, TableBuilder, TableOptions,
 };
@@ -51,7 +52,7 @@ pub struct Core {
     pub(crate) opts: AgateOptions,
     pub(crate) manifest: Arc<ManifestFile>,
     pub(crate) lvctl: LevelsController,
-    pub(crate) vlog: Arc<Option<ValueLog>>,
+    pub(crate) vlog: ValueLogWrapper,
     write_channel: (Sender<Request>, Receiver<Request>),
     flush_channel: (Sender<Option<FlushTask>>, Receiver<Option<FlushTask>>),
 
@@ -59,6 +60,8 @@ pub struct Core {
     is_closed: AtomicBool,
 
     pub(crate) orc: Arc<Oracle>,
+
+    gc_running: AtomicBool,
 }
 
 pub struct Agate {
@@ -181,12 +184,13 @@ impl Core {
             opts: opts.clone(),
             manifest,
             lvctl,
-            vlog: Arc::new(ValueLog::new(opts.clone())?),
+            vlog: ValueLogWrapper(Arc::new(ValueLog::new(opts.clone())?)),
             write_channel: bounded(KV_WRITE_CH_CAPACITY),
             flush_channel: crossbeam_channel::bounded(opts.num_memtables),
             block_writes: AtomicBool::new(false),
             is_closed: AtomicBool::new(false),
             orc,
+            gc_running: AtomicBool::default(),
         };
 
         core.orc.init_next_ts(core.max_version());
@@ -216,7 +220,7 @@ impl Core {
             return Ok(MemTable::new(file_id, skl, None, opts.clone()));
         }
 
-        let wal = Wal::open(path, opts.clone())?;
+        let wal = Wal::open(file_id as u32, path, opts.clone())?;
         // TODO: delete WAL when skiplist ref count becomes zero
 
         let mem_table = MemTable::new(file_id, skl, Some(wal), opts.clone());
@@ -503,7 +507,7 @@ impl Core {
         let dones: Vec<_> = requests.iter().map(|x| x.done.clone()).collect();
 
         let write = || {
-            if let Some(ref vlog) = *self.vlog {
+            if let Some(ref vlog) = **self.vlog {
                 vlog.write(&mut requests)?;
             }
 
@@ -656,6 +660,10 @@ impl Core {
         unreachable!()
     }
 
+    pub(crate) fn value_log(&self) -> &ValueLog {
+        self.vlog.as_ref().as_ref().unwrap()
+    }
+
     // Triggers a value log garbage collection.
     //
     // It picks value log files to perform GC based on statistics that are collected
@@ -691,9 +699,560 @@ impl Core {
             return Err(Error::ErrInvalidRequest);
         }
 
-        self.vlog.as_ref().as_ref().unwrap().run_gc(discard_ratio)
+        self.run_gc(discard_ratio)
     }
+
+    fn run_gc(&self, discard_ratio: f64) -> Result<()> {
+        // spadea(todo): downgrade ordering
+        let _ = self
+            .gc_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| Error::ErrRejected)?;
+
+        let lf = self
+            .value_log()
+            .pick_log(discard_ratio)
+            .ok_or(Error::ErrNoRewrite)?;
+        let gc_result = self.do_run_gc(lf);
+
+        self.gc_running.store(false, Ordering::SeqCst);
+        gc_result
+    }
+
+    fn do_run_gc(&self, log_file: Arc<RwLock<Wal>>) -> Result<()> {
+        // spadea(todo): port span
+        let log_file = log_file.read().unwrap();
+        let fid = log_file.file_id();
+        self.rewrite(&log_file)?;
+        // Remove the file from discardStats.
+        self.value_log().discard_stats().update(fid, -1);
+        Ok(())
+    }
+
+    fn rewrite(&self, log_file: &RwLockReadGuard<Wal>) -> Result<()> {
+        let inner = self.vlog.value_log().inner().read().unwrap();
+        let fid = log_file.file_id();
+        if inner.files_to_delete().iter().any(|id| *id == fid) {
+            return Err(Error::Other(format!(
+                "value log file already marked for deletion fid {}",
+                fid
+            )));
+        }
+
+        let max_fid = inner.max_fid();
+        assert!(fid < max_fid);
+        // spadea(todo): verify
+        drop(inner);
+
+        info!("Rewriting fid: {}", fid);
+        let mut wb: Vec<Entry> = Vec::with_capacity(1000);
+        let mut size = 0;
+        let (mut count, mut moved) = (0, 0);
+
+        let mut fe = |e: EntryRef, wb: &mut Vec<Entry>| -> Result<()> {
+            count += 1;
+            if count % 100000 == 0 {
+                debug!("Processing entry {:?}", count);
+            }
+
+            // spadea(todo): can we avoid clone?
+            let val = self.get(&Bytes::from(e.key.to_vec()))?;
+            if discard_entry(&e, &val) {
+                return Ok(());
+            }
+
+            // Value is still present in value log
+
+            if val.value.is_empty() {
+                return Err(Error::Other(format!("Empty value {:?}", val)));
+            }
+
+            let mut vp = ValuePointer::default();
+            vp.decode(&val.value);
+
+            // If the entry found from the LSM Tree points to a newer vlog file,
+            // don't do anything.
+            if vp.file_id > fid {
+                return Ok(());
+            }
+
+            // If the entry found from the LSM Tree points to an offset greater than the one
+            // read from vlog, don't do anything.
+            if vp.offset > e.offset {
+                return Ok(());
+            }
+
+            // If the entry read from LSM Tree and vlog file point to the same vlog file and offset,
+            // insert them back into the DB.
+            // NOTE: It might be possible that the entry read from the LSM Tree points to
+            // an older vlog file. See the comments in the else part.
+            if vp.file_id == fid && vp.offset == e.offset {
+                moved += 1;
+                let mut new_entry = e.to_owned();
+                new_entry.meta = e.meta & (!(VALUE_POINTER | VALUE_TXN | VALUE_FIN_TXN));
+                let mut es = new_entry.estimate_size(self.opts.value_threshold);
+                // Consider size of value as well while considering the total size
+                // of the batch. There have been reports of high memory usage in
+                // rewrite because we don't consider the value size. See #1292.
+                es += e.value.len();
+
+                // Ensure length and size of wb is within transaction limits.
+                if wb.len() + 1 >= self.opts.max_batch_count as usize
+                    || size + es > self.opts.max_batch_size as usize
+                {
+                    self.batch_set(std::mem::take(wb))?;
+                    size = 0;
+                    *wb = Vec::with_capacity(1000);
+                }
+
+                wb.push(new_entry);
+                size += es;
+            } else {
+                // It might be possible that the entry read from LSM Tree points to
+                // an older vlog file.  This can happen in the following situation.
+                // Assume DB is opened with
+                // numberOfVersionsToKeep=1
+                //
+                // Now, if we have ONLY one key in the system "FOO" which has been
+                // updated 3 times and the same key has been garbage collected 3
+                // times, we'll have 3 versions of the movekey
+                // for the same key "FOO".
+                //
+                // NOTE: moveKeyi is the gc'ed version of the original key with version i
+                // We're calling the gc'ed keys as moveKey to simplify the
+                // explanantion. We used to add move keys but we no longer do that.
+                //
+                // Assume we have 3 move keys in L0.
+                // - moveKey1 (points to vlog file 10),
+                // - moveKey2 (points to vlog file 14) and
+                // - moveKey3 (points to vlog file 15).
+                //
+                // Also, assume there is another move key "moveKey1" (points to
+                // vlog file 6) (this is also a move Key for key "FOO" ) on upper
+                // levels (let's say 3). The move key "moveKey1" on level 0 was
+                // inserted because vlog file 6 was GCed.
+                //
+                // Here's what the arrangement looks like
+                // L0 => (moveKey1 => vlog10), (moveKey2 => vlog14), (moveKey3 => vlog15)
+                // L1 => ....
+                // L2 => ....
+                // L3 => (moveKey1 => vlog6)
+                //
+                // When L0 compaction runs, it keeps only moveKey3 because the number of versions
+                // to keep is set to 1. (we've dropped moveKey1's latest version)
+                //
+                // The new arrangement of keys is
+                // L0 => ....
+                // L1 => (moveKey3 => vlog15)
+                // L2 => ....
+                // L3 => (moveKey1 => vlog6)
+                //
+                // Now if we try to GC vlog file 10, the entry read from vlog file
+                // will point to vlog10 but the entry read from LSM Tree will point
+                // to vlog6. The move key read from LSM tree will point to vlog6
+                // because we've asked for version 1 of the move key.
+                //
+                // This might seem like an issue but it's not really an issue
+                // because the user has set the number of versions to keep to 1 and
+                // the latest version of moveKey points to the correct vlog file
+                // and offset. The stale move key on L3 will be eventually dropped
+                // by compaction because there is a newer versions in the upper
+                // levels.
+            }
+
+            Ok(())
+        };
+
+        let mut iter = log_file.iter().unwrap();
+        while let Some(e) = iter.next()? {
+            fe(e, &mut wb)?;
+        }
+
+        let mut batch_size = 1024;
+        let mut loops = 0;
+        let mut i = 0;
+        while i < wb.len() {
+            loops += 1;
+            if batch_size == 0 {
+                warn!("We shouldn't reach batch size of zero.");
+                return Err(Error::ErrNoRewrite);
+            }
+
+            let end = usize::min(i + batch_size, wb.len());
+            match self.batch_set(wb[i..end].to_vec()) {
+                Err(Error::TxnTooBig) => {
+                    batch_size /= 2;
+                    continue;
+                }
+                e @ Err(_) => return e,
+                _ => {}
+            }
+            i += batch_size;
+        }
+
+        info!("Processed {} entries in {} loops", wb.len(), loops);
+        info!("Total entries: {}. Moved: {}", count, moved);
+        info!("Removing fid: {}", fid);
+
+        let mut inner = self.vlog.value_log().inner().write().unwrap();
+        let mut delete_file_now = false;
+        if inner.files_map().get(&fid).is_none() {
+            return Err(Error::Other(format!("Unable to find fid {}", fid)));
+        }
+
+        // no other object holding it
+        if Arc::strong_count(&self.vlog) == 1 {
+            inner.files_map_mut().remove(&fid);
+            delete_file_now = true;
+        } else {
+            inner.files_to_delete_mut().push(fid);
+        }
+
+        if delete_file_now {
+            self.vlog.value_log().discard_stats().update(fid, -1);
+        }
+
+        Ok(())
+    }
+
+    fn batch_set(&self, entries: Vec<Entry>) -> Result<()> {
+        let done = self.send_to_write_channel(entries)?;
+        done.recv().unwrap()
+    }
+}
+
+fn discard_entry(e: &EntryRef, val: &Value) -> bool {
+    if val.version != get_ts(e.key) {
+        // Version not found. Discard.
+        return true;
+    }
+
+    if is_deleted_or_expired(val.meta, val.expires_at) {
+        return true;
+    }
+
+    if val.meta & VALUE_POINTER == 0 {
+        // Key also stores the value in LSM. Discard.
+        return true;
+    }
+
+    if val.meta & VALUE_FIN_TXN > 0 {
+        // Just a txn finish entry. Discard.
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod test {
+
+    use crate::{
+        test_tuil::{txn_delete, txn_set},
+        IteratorOptions,
+    };
+
+    use super::*;
+    use rand::distributions::{Alphanumeric, DistString};
+
+    #[test]
+    fn test_value_gc() {
+        let dir = tempdir::TempDir::new("gc-test").unwrap();
+        let mut opts = AgateOptions::default_for_test(dir.path());
+        opts.value_log_file_size = 1 << 20;
+        opts.base_table_size = 1 << 15;
+        opts.value_threshold = 1 << 10;
+
+        let db = opts.open().unwrap();
+
+        let sz = 32 << 10;
+        let mut txn = db.new_transaction(true);
+        for i in 0..100 {
+            let val = Alphanumeric.sample_string(&mut rand::thread_rng(), sz);
+            txn.set_entry(Entry::new(
+                Bytes::from(format!("key{:03}", i)),
+                Bytes::from(val),
+            ))
+            .unwrap();
+            if i % 20 == 0 {
+                txn.commit().unwrap();
+                txn = db.new_transaction(true);
+            }
+        }
+        txn.commit().unwrap();
+
+        for i in 0..45 {
+            txn_delete(&db, Bytes::from(format!("key{:03}", i)));
+        }
+
+        let log_file_path = {
+            let log_file = db.core.value_log().get_log_file(1).unwrap();
+            let log_file_gaurd = log_file.read().unwrap();
+            let path = log_file_gaurd.file_path().to_owned();
+
+            db.core.rewrite(&log_file_gaurd).unwrap();
+            path
+        };
+        assert!(!log_file_path.exists());
+
+        for i in 45..100 {
+            let key = Bytes::from(format!("key{:03}", i));
+            db.view(|txn| {
+                let item = txn.get(&key).unwrap();
+                let val = item.value();
+                assert_eq!(val.len(), sz);
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_value_gc2() {
+        let dir = tempdir::TempDir::new("gc-test").unwrap();
+        let mut opts = AgateOptions::default_for_test(dir.path());
+        opts.value_log_file_size = 1 << 20;
+        opts.base_table_size = 1 << 15;
+        opts.value_threshold = 1 << 10;
+
+        let db = opts.open().unwrap();
+
+        let sz = 32 << 10;
+        let mut txn = db.new_transaction(true);
+        for i in 0..100 {
+            let val = Alphanumeric.sample_string(&mut rand::thread_rng(), sz);
+            txn.set_entry(Entry::new(
+                Bytes::from(format!("key{:03}", i)),
+                Bytes::from(val),
+            ))
+            .unwrap();
+            if i % 20 == 0 {
+                txn.commit().unwrap();
+                txn = db.new_transaction(true);
+            }
+        }
+        txn.commit().unwrap();
+
+        for i in 0..5 {
+            txn_delete(&db, Bytes::from(format!("key{:03}", i)));
+        }
+
+        for i in 5..10 {
+            txn_set(
+                &db,
+                Bytes::from(format!("key{:03}", i)),
+                Bytes::from(format!("value{:03}", i)),
+                0,
+            );
+        }
+
+        let log_file_path = {
+            let log_file = db.core.value_log().get_log_file(1).unwrap();
+            let log_file_gaurd = log_file.read().unwrap();
+            let path = log_file_gaurd.file_path().to_owned();
+
+            db.core.rewrite(&log_file_gaurd).unwrap();
+            path
+        };
+        assert!(!log_file_path.exists());
+
+        for i in 0..5 {
+            let key = Bytes::from(format!("key{:03}", i));
+            db.view(|txn| {
+                match txn.get(&key) {
+                    Err(Error::KeyNotFound(_)) => {}
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        for i in 5..10 {
+            let key = Bytes::from(format!("key{:03}", i));
+            db.view(|txn| {
+                let item = txn.get(&key).unwrap();
+                let val = item.value();
+                assert_eq!(val, Bytes::from(format!("value{:03}", i)));
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        // Moved entries.
+        for i in 10..100 {
+            let key = Bytes::from(format!("key{:03}", i));
+            db.view(|txn| {
+                let item = txn.get(&key).unwrap();
+                let val = item.value();
+                assert_eq!(val.len(), sz);
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_value_gc3() {
+        let dir = tempdir::TempDir::new("gc-test").unwrap();
+        let mut opts = AgateOptions::default_for_test(dir.path());
+        opts.value_log_file_size = 1 << 20;
+        opts.base_table_size = 1 << 15;
+        opts.value_threshold = 1 << 10;
+
+        let db = opts.open().unwrap();
+
+        let sz = 32 << 10;
+        let mut txn = db.new_transaction(true);
+        let mut value3 = None;
+        for i in 0..100 {
+            let val = Alphanumeric.sample_string(&mut rand::thread_rng(), sz);
+            if i == 3 {
+                value3 = Some(val.clone());
+            }
+            txn.set_entry(Entry::new(
+                Bytes::from(format!("key{:03}", i)),
+                Bytes::from(val),
+            ))
+            .unwrap();
+            if i % 20 == 0 {
+                txn.commit().unwrap();
+                txn = db.new_transaction(true);
+            }
+        }
+        txn.commit().unwrap();
+
+        let it_opts = IteratorOptions {
+            prefetch_values: false,
+            prefetch_size: 0,
+            reverse: false,
+            ..Default::default()
+        };
+        let txn = db.new_transaction(true);
+        let mut iter = txn.new_iterator(&it_opts);
+
+        iter.rewind();
+        assert!(iter.valid());
+        let mut item = iter.item();
+        assert_eq!(Bytes::from("key000"), item.key);
+
+        iter.next();
+        assert!(iter.valid());
+        item = iter.item();
+        assert_eq!(Bytes::from("key001"), item.key);
+
+        iter.next();
+        assert!(iter.valid());
+        item = iter.item();
+        assert_eq!(Bytes::from("key002"), item.key);
+
+        // Like other tests, we pull out a logFile to rewrite it directly
+
+        let log_file_path = {
+            let log_file = db.core.value_log().get_log_file(1).unwrap();
+            let log_file_gaurd = log_file.read().unwrap();
+            let path = log_file_gaurd.file_path().to_owned();
+
+            db.core.rewrite(&log_file_gaurd).unwrap();
+            path
+        };
+        // the log file shoud exist as txn iterator is not released
+        assert!(log_file_path.exists());
+
+        iter.next();
+        assert!(iter.valid());
+        item = iter.item();
+        assert_eq!(Bytes::from("key003"), item.key);
+        let val = item.value();
+        assert_eq!(val, value3.unwrap());
+
+        drop(iter);
+        // now the log file shoud be deleted
+        assert!(!log_file_path.exists());
+    }
+
+    #[test]
+    fn test_value_gc4() {
+        let dir = tempdir::TempDir::new("gc-test").unwrap();
+        let mut opts = AgateOptions::default_for_test(dir.path());
+        opts.value_log_file_size = 1 << 20;
+        opts.base_table_size = 1 << 15;
+        opts.value_threshold = 1 << 10;
+
+        let db = opts.open().unwrap();
+
+        let sz = 128 << 10;
+        let mut txn = db.new_transaction(true);
+        for i in 0..24 {
+            let val = Alphanumeric.sample_string(&mut rand::thread_rng(), sz);
+            txn.set_entry(Entry::new(
+                Bytes::from(format!("key{:03}", i)),
+                Bytes::from(val),
+            ))
+            .unwrap();
+            if i % 3 == 0 {
+                txn.commit().unwrap();
+                txn = db.new_transaction(true);
+            }
+        }
+        txn.commit().unwrap();
+
+        for i in 0..8 {
+            txn_delete(&db, Bytes::from(format!("key{:03}", i)));
+        }
+
+        for i in 8..16 {
+            txn_set(
+                &db,
+                Bytes::from(format!("key{:03}", i)),
+                Bytes::from(format!("value{:03}", i)),
+                0,
+            );
+        }
+
+        let (log_file_path, log_file_path2) = {
+            let log_file = db.core.value_log().get_log_file(1).unwrap();
+            let log_file_gaurd = log_file.read().unwrap();
+            let path = log_file_gaurd.file_path().to_owned();
+            db.core.rewrite(&log_file_gaurd).unwrap();
+
+            let log_file = db.core.value_log().get_log_file(2).unwrap();
+            let log_file_gaurd = log_file.read().unwrap();
+            let path2 = log_file_gaurd.file_path().to_owned();
+            db.core.rewrite(&log_file_gaurd).unwrap();
+
+            (path, path2)
+        };
+        assert!(!log_file_path.exists());
+        assert!(!log_file_path2.exists());
+        drop(db);
+
+        let db = opts.open().unwrap();
+        for i in 0..8 {
+            let key = Bytes::from(format!("key{:03}", i));
+            db.view(|txn| {
+                match txn.get(&key) {
+                    Err(Error::KeyNotFound(_)) => {}
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        for i in 8..16 {
+            let key = Bytes::from(format!("key{:03}", i));
+            db.view(|txn| {
+                let item = txn.get(&key).unwrap();
+                let val = item.value();
+                assert_eq!(val, Bytes::from(format!("value{:03}", i)));
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    // discard stats
+}

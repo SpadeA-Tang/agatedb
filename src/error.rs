@@ -12,6 +12,8 @@ use crate::value::ValuePointer;
 
 #[derive(Debug, Error, Clone)]
 pub enum Error {
+    #[error("Other error: {0}")]
+    Other(String),
     #[error("Invalid Configuration: {0}")]
     Config(String),
     #[error("IO error: {0}")]
@@ -70,6 +72,10 @@ pub enum Error {
     ErrGCInMemoryMode,
     #[error("Invalid request")]
     ErrInvalidRequest,
+    #[error("Value log GC request rejected")]
+    ErrRejected,
+    #[error("Value log GC attempt didn't result in any cleanup")]
+    ErrNoRewrite,
 }
 
 impl From<io::Error> for Error {

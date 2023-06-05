@@ -12,6 +12,7 @@ use crate::{
     ops::transaction::{Transaction, AGATE_PREFIX},
     table::{MergeIterator, TableIterators},
     value::{ValuePointer, VALUE_POINTER},
+    value_log::ValueLogWrapper,
     wal::Wal,
     AgateIterator, Table, Value,
 };
@@ -82,7 +83,7 @@ impl Item {
 
         let mut vptr = ValuePointer::default();
         vptr.decode(&self.vptr);
-        let vlog = (*self.core.vlog).as_ref().unwrap();
+        let vlog = (**self.core.vlog).as_ref().unwrap();
         let raw_buffer = vlog.read(vptr);
         if let Ok(mut raw_buffer) = raw_buffer {
             let entry = Wal::decode_entry(&mut raw_buffer).unwrap();
@@ -202,6 +203,9 @@ pub struct Iterator<'a> {
 
     /// Used to skip over multiple versions of the same key.
     last_key: BytesMut,
+
+    // not used, but needed to avoid vlog gc
+    _vlog: ValueLogWrapper,
 }
 
 impl Transaction {
@@ -248,6 +252,7 @@ impl Transaction {
             opt: opt.clone(),
             item: None,
             last_key: BytesMut::new(),
+            _vlog,
         }
     }
 }
