@@ -22,6 +22,7 @@ use yatp::task::callback::Handle;
 
 use crate::{
     closer::Closer,
+    defer,
     entry::{Entry, EntryRef},
     get_ts,
     iterator::is_deleted_or_expired,
@@ -148,14 +149,19 @@ impl Agate {
         self.core.write_requests(request)
     }
 
+    pub fn flatten(&mut self, workers: u64) -> Result<()> {
+        self.stop_compaction();
+        let ret = self.flatten_impl(workers);
+        self.start_compaction();
+        ret
+    }
+
     // Flatten can be used to force compactions on the LSM tree so all the tables fall on the same
     // level. This ensures that all the versions of keys are colocated and not split across multiple
     // levels, which is necessary after a restore from backup. During Flatten, live compactions are
     // stopped. Ideally, no writes are going on during Flatten. Otherwise, it would create competition
     // between flattening the tree and new tables being created at level zero.
-    pub fn flatten(&self, workers: u64) -> Result<()> {
-        self.core.stop_compaction();
-
+    fn flatten_impl(&self, workers: u64) -> Result<()> {
         let compact_away = |cp: CompactionPriority| -> Result<()> {
             info!("Attempting to compact with {:?}", cp);
             let (tx, rx) = sync_channel(1);
@@ -236,6 +242,23 @@ impl Agate {
             compact_away(cp)?;
         }
     }
+
+    fn stop_compaction(&self) {
+        self.closer.close();
+        for i in 0..self.core.opts.num_compactors {
+            println!("{} done", i);
+            self.closer.wait_done();
+        }
+    }
+
+    fn start_compaction(&mut self) {
+        assert!(!self.closer.is_some());
+        let closer = Closer::new();
+        self.core
+            .lvctl
+            .start_compact(closer.clone(), self.pool.clone());
+        self.closer = closer;
+    }
 }
 
 impl Drop for Agate {
@@ -260,7 +283,13 @@ impl Core {
         // create first mem table
         let orc = Arc::new(Oracle::new(opts));
         let manifest = Arc::new(ManifestFile::open_or_create_manifest_file(opts)?);
-        let lvctl = LevelsController::new(opts, manifest.clone(), orc.clone())?;
+
+        let mut discard_stats = None;
+        let vlog = ValueLog::new(opts.clone())?;
+        if let Some(ref vlog) = vlog {
+            discard_stats = Some(vlog.discard_stats().clone());
+        }
+        let lvctl = LevelsController::new(opts, manifest.clone(), orc.clone(), discard_stats)?;
 
         let (imm_tables, mut next_mem_fid) = Self::open_mem_tables(opts)?;
         let mt = Self::open_mem_table(opts, next_mem_fid)?;
@@ -275,7 +304,7 @@ impl Core {
             opts: opts.clone(),
             manifest,
             lvctl,
-            vlog: ValueLogWrapper(Arc::new(ValueLog::new(opts.clone())?)),
+            vlog: ValueLogWrapper(Arc::new(vlog)),
             write_channel: bounded(KV_WRITE_CH_CAPACITY),
             flush_channel: crossbeam_channel::bounded(opts.num_memtables),
             block_writes: AtomicBool::new(false),
@@ -800,13 +829,15 @@ impl Core {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| Error::ErrRejected)?;
 
+        defer!({
+            self.gc_running.store(false, Ordering::SeqCst);
+        });
+
         let lf = self
             .value_log()
             .pick_log(discard_ratio)
             .ok_or(Error::ErrNoRewrite)?;
         let gc_result = self.do_run_gc(lf);
-
-        self.gc_running.store(false, Ordering::SeqCst);
         gc_result
     }
 
@@ -1009,14 +1040,6 @@ impl Core {
     fn batch_set(&self, entries: Vec<Entry>) -> Result<()> {
         let done = self.send_to_write_channel(entries)?;
         done.recv().unwrap()
-    }
-
-    fn stop_compaction(&self) {
-        unimplemented!()
-    }
-
-    fn start_compaction(&self) {
-        unimplemented!()
     }
 }
 

@@ -123,6 +123,35 @@ macro_rules! assert_bytes_eq {
     };
 }
 
+/// Invokes the wrapped closure when dropped.
+pub struct DeferContext<T: FnOnce()> {
+    t: Option<T>,
+}
+
+impl<T: FnOnce()> DeferContext<T> {
+    pub fn new(t: T) -> DeferContext<T> {
+        DeferContext { t: Some(t) }
+    }
+}
+
+impl<T: FnOnce()> Drop for DeferContext<T> {
+    fn drop(&mut self) {
+        self.t.take().unwrap()()
+    }
+}
+
+/// Simulates Go's defer.
+///
+/// Please note that, different from go, this defer is bound to scope.
+/// When exiting the scope, its deferred calls are executed in last-in-first-out
+/// order.
+#[macro_export]
+macro_rules! defer {
+    ($t:expr) => {
+        let __ctx = $crate::util::DeferContext::new(|| $t);
+    };
+}
+
 #[cfg(test)]
 mod test {
     use std::time::{SystemTime, UNIX_EPOCH};

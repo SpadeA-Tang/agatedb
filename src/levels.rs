@@ -6,6 +6,7 @@ pub(crate) use compaction::CompactionPriority;
 pub(crate) mod tests;
 
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
@@ -26,6 +27,7 @@ use yatp::task::callback::Handle;
 
 use crate::{
     closer::Closer,
+    discard::DiscardStats,
     format::{get_ts, key_with_ts, user_key},
     iterator::{is_deleted_or_expired, IteratorOptions},
     manifest::{new_create_change, new_delete_change, ManifestFile},
@@ -33,7 +35,7 @@ use crate::{
     opt::build_table_options,
     table::{MergeIterator, TableIterators},
     util::{self, has_any_prefixes, same_key, KeyComparator, COMPARATOR},
-    value::{Value, ValuePointer},
+    value::{Value, ValuePointer, VALUE_POINTER},
     AgateIterator, AgateOptions, Error, Result, Table, TableBuilder,
 };
 
@@ -48,6 +50,7 @@ pub(crate) struct LevelsControllerInner {
     cpt_status: RwLock<CompactStatus>,
     manifest: Arc<ManifestFile>,
     // TODO: Add l0_stalls_ms.
+    discard_stats: Option<DiscardStats>,
 }
 
 pub struct LevelsController {
@@ -55,8 +58,14 @@ pub struct LevelsController {
 }
 
 impl LevelsControllerInner {
-    fn new(opts: &AgateOptions, manifest: Arc<ManifestFile>, orc: Arc<Oracle>) -> Result<Self> {
+    fn new(
+        opts: &AgateOptions,
+        manifest: Arc<ManifestFile>,
+        orc: Arc<Oracle>,
+        discard_stats: Option<DiscardStats>,
+    ) -> Result<Self> {
         assert!(opts.num_level_zero_tables_stall > opts.num_level_zero_tables);
+        assert_eq!(opts.in_memory, discard_stats.is_none());
 
         let mut inner = LevelsControllerInner {
             next_file_id: AtomicU64::new(0),
@@ -65,6 +74,7 @@ impl LevelsControllerInner {
             orc,
             cpt_status: RwLock::new(CompactStatus::default()),
             manifest: manifest.clone(),
+            discard_stats,
         };
 
         {
@@ -115,6 +125,10 @@ impl LevelsControllerInner {
         util::sync_dir(&opts.dir)?;
 
         Ok(inner)
+    }
+
+    pub(crate) fn set_discard_stats(&mut self, discard_stats: DiscardStats) {
+        self.discard_stats = Some(discard_stats);
     }
 
     /// Calculates the [`Targets`] for levels in the LSM tree.
@@ -255,6 +269,18 @@ impl LevelsControllerInner {
         let discard_ts = self.orc.discard_at_or_below();
 
         // TODO: Collect stats for GC.
+        let mut discard_stats = HashMap::new();
+        let mut update_stats = |val: Value| {
+            if self.opts.in_memory {
+                return;
+            }
+            if val.meta & VALUE_POINTER > 0 {
+                let mut vp = ValuePointer::default();
+                vp.decode(&val.value);
+                let prev = discard_stats.entry(vp.file_id).or_insert(0);
+                *prev += vp.len;
+            }
+        };
 
         // TODO: Check if the given key-range overlaps with next_level too much.
 
@@ -307,7 +333,7 @@ impl LevelsControllerInner {
                     && has_any_prefixes(&iter_key, &compact_def.drop_prefixes)
                 {
                     num_skips += 1;
-                    // TODO: Update stats of vlog.
+                    update_stats(iter.value());
 
                     iter.next();
                     continue;
@@ -317,7 +343,7 @@ impl LevelsControllerInner {
                 if !skip_key.is_empty() {
                     if same_key(&iter_key, &skip_key) {
                         num_skips += 1;
-                        // TODO: Update stats of vlog.
+                        update_stats(iter.value());
 
                         iter.next();
                         continue;
@@ -402,7 +428,7 @@ impl LevelsControllerInner {
                         } else {
                             // If no overlap, we can skip all the versions, by continuing here.
                             num_skips += 1;
-                            // TODO: update stats of vlog
+                            update_stats(vs);
 
                             iter.next();
                             continue;
@@ -435,6 +461,12 @@ impl LevelsControllerInner {
             };
 
             tables.push(table);
+        }
+
+        if let Some(ref stats) = self.discard_stats {
+            for (fid, discard) in discard_stats {
+                stats.update(fid, discard as isize);
+            }
         }
 
         info!(
@@ -963,9 +995,19 @@ impl LevelsControllerInner {
 }
 
 impl LevelsController {
-    pub fn new(opts: &AgateOptions, manifest: Arc<ManifestFile>, orc: Arc<Oracle>) -> Result<Self> {
+    pub fn new(
+        opts: &AgateOptions,
+        manifest: Arc<ManifestFile>,
+        orc: Arc<Oracle>,
+        discard_stats: Option<DiscardStats>,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: Arc::new(LevelsControllerInner::new(opts, manifest, orc)?),
+            inner: Arc::new(LevelsControllerInner::new(
+                opts,
+                manifest,
+                orc,
+                discard_stats,
+            )?),
         })
     }
 
@@ -1036,7 +1078,10 @@ impl LevelsController {
             loop {
                 select! {
                     recv(ticker) -> _ => run_once(),
-                    recv(closer.get_receiver()) -> _ => return
+                    recv(closer.get_receiver()) -> _ => {
+                        closer.done();
+                        return
+                    }
                 }
             }
         });

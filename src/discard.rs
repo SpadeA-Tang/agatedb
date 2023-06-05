@@ -10,16 +10,16 @@ use memmap2::{MmapMut, MmapOptions};
 use std::{
     fs::{File, OpenOptions},
     mem::ManuallyDrop,
-    sync::RwLock,
+    sync::{Arc, RwLock},
 };
 
 const DISCARD_FNAME: &str = "DISCARD";
 
 // keeps track of the amount of data that could be discarded for
 // a given logfile.
-pub(crate) struct DiscardStats {
-    inner: RwLock<DiscardStatsInner>,
-    opts: AgateOptions,
+#[derive(Clone)]
+pub struct DiscardStats {
+    inner: Arc<RwLock<DiscardStatsInner>>,
 }
 
 impl DiscardStats {
@@ -37,12 +37,12 @@ impl DiscardStats {
         let mmap_file = ManuallyDrop::new(unsafe { MmapOptions::new().map_mut(&file)? });
 
         let discard_stats = DiscardStats {
-            inner: RwLock::new(DiscardStatsInner {
+            inner: Arc::new(RwLock::new(DiscardStatsInner {
                 file: ManuallyDrop::new(file),
                 mmap_file,
                 next_empty_slot: 0,
-            }),
-            opts,
+                opts,
+            })),
         };
 
         {
@@ -135,6 +135,8 @@ pub struct DiscardStatsInner {
     // 1GB file can store 67M discard entries. Each entry is 16 bytes.
     mmap_file: ManuallyDrop<MmapMut>,
     next_empty_slot: usize,
+
+    opts: AgateOptions,
 }
 
 impl DiscardStatsInner {
@@ -175,7 +177,7 @@ impl IndexSort for DiscardStatsInner {
     }
 
     fn less(&self, i: usize, j: usize) -> bool {
-        self.get(i * 16 + 8) < self.get(j * 16 + 8)
+        self.get(i * 16) < self.get(j * 16)
     }
 
     fn swap(&mut self, i: usize, j: usize) {

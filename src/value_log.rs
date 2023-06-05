@@ -399,6 +399,7 @@ impl ValueLog {
             // vlog files start from 1.
             if fid == 0 {
                 info!("No file with discard stats");
+                return None;
             }
             let lf = match inner.files_map.get(&fid) {
                 Some(lf) => lf.read().unwrap(),

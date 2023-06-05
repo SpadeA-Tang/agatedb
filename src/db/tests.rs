@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fs::read_dir, os::unix::prelude::MetadataExt, path::Path};
 
 use bytes::{Bytes, BytesMut};
 use rand::distributions::{Alphanumeric, DistString};
@@ -216,8 +216,85 @@ fn test_flush_l1() {
 }
 
 #[test]
+fn test_value_gc_managed() {
+    let dir = tempdir::TempDir::new("agate-test").unwrap();
+    let n = 10000;
+
+    let mut opts = AgateOptions::default_for_test(dir.path());
+    opts.value_log_max_entries = n / 10;
+    opts.managed_txns = true;
+    opts.base_table_size = 1 << 15;
+    opts.value_threshold = 1 << 10;
+    opts.mem_table_size = 1 << 15;
+
+    let mut db = opts.open().unwrap();
+    let mut ts = 0;
+    let mut new_ts = || -> u64 {
+        ts += 1;
+        ts
+    };
+
+    let sz = 64 << 10;
+    for i in 0..n {
+        let value = Bytes::from(Alphanumeric.sample_string(&mut rand::thread_rng(), sz));
+        let mut txn = db.new_transaction_at(new_ts(), true);
+        txn.set_entry(Entry::new(Bytes::from(format!("key{:03}", i)), value))
+            .unwrap();
+        txn.commit_at(new_ts()).unwrap();
+    }
+
+    for i in 0..n {
+        let mut txn = db.new_transaction_at(new_ts(), true);
+        txn.delete(Bytes::from(format!("key{:03}", i))).unwrap();
+        txn.commit_at(new_ts()).unwrap();
+    }
+
+    let mut entries = read_dir(dir.path()).unwrap();
+    while let Some(Ok(e)) = entries.next() {
+        let meta = e.metadata().unwrap();
+        println!(
+            "File {:?}. Size {:?}.",
+            e.path(),
+            human_bytes(meta.size() as f64)
+        );
+    }
+
+    db.set_discard_ts(u32::MAX as u64);
+    db.flatten(3).unwrap();
+
+    println!("After flatten");
+    let mut entries = read_dir(dir.path()).unwrap();
+    while let Some(Ok(e)) = entries.next() {
+        let meta = e.metadata().unwrap();
+        println!(
+            "File {:?}. Size {:?}.",
+            e.path(),
+            human_bytes(meta.size() as f64)
+        );
+    }
+
+    for _ in 0..100 {
+        // Try at max 100 times to GC even a single value log file.
+        if let Err(_) = db.core.run_value_log_gc(0.0001) {
+            break;
+        }
+    }
+
+    println!("After gc");
+    let mut entries = read_dir(dir.path()).unwrap();
+    while let Some(Ok(e)) = entries.next() {
+        let meta = e.metadata().unwrap();
+        println!(
+            "File {:?}. Size {:?}.",
+            e.path(),
+            human_bytes(meta.size() as f64)
+        );
+    }
+}
+
+#[test]
 fn test_db_growth() {
-    let dir = tempdir::TempDir::new("gc-test").unwrap();
+    let dir = tempdir::TempDir::new("agate-test").unwrap();
 
     let mut start = 0;
     let mut last_start = 0;
@@ -227,7 +304,7 @@ fn test_db_growth() {
 
     let discard_ratio = 0.001;
     let max_writes = 200;
-    let opts = AgateOptions::default_for_test(dir);
+    let mut opts = AgateOptions::default_for_test(dir.path());
     opts.value_log_file_size = 64 << 15;
     opts.base_table_size = 4 << 15;
     opts.base_level_size = 16 << 15;
