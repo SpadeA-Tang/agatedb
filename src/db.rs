@@ -243,10 +243,10 @@ impl Agate {
         }
     }
 
+    // todo(spadea): review it.
     fn stop_compaction(&self) {
         self.closer.close();
         for i in 0..self.core.opts.num_compactors {
-            println!("{} done", i);
             self.closer.wait_done();
         }
     }

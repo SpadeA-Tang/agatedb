@@ -550,7 +550,7 @@ fn test_value_gc_managed() {
     let mut entries = read_dir(dir.path()).unwrap();
     while let Some(Ok(e)) = entries.next() {
         let meta = e.metadata().unwrap();
-        println!(
+        info!(
             "File {:?}. Size {:?}.",
             e.path(),
             human_bytes(meta.size() as f64)
@@ -560,11 +560,11 @@ fn test_value_gc_managed() {
     db.set_discard_ts(u32::MAX as u64);
     db.flatten(3).unwrap();
 
-    println!("After flatten");
+    info!("After flatten");
     let mut entries = read_dir(dir.path()).unwrap();
     while let Some(Ok(e)) = entries.next() {
         let meta = e.metadata().unwrap();
-        println!(
+        info!(
             "File {:?}. Size {:?}.",
             e.path(),
             human_bytes(meta.size() as f64)
@@ -578,16 +578,28 @@ fn test_value_gc_managed() {
         }
     }
 
-    println!("After gc");
+    info!("After gc");
     let mut entries = read_dir(dir.path()).unwrap();
+    // now, we should only have one .sst and one .vlog file.
+    let mut sst_count = 0;
+    let mut vlog_count = 0;
     while let Some(Ok(e)) = entries.next() {
+        if e.file_name().to_str().unwrap().ends_with(".sst") {
+            sst_count += 1;
+        }
+        if e.file_name().to_str().unwrap().ends_with(".vlog") {
+            vlog_count += 1;
+        }
         let meta = e.metadata().unwrap();
-        println!(
+        info!(
             "File {:?}. Size {:?}.",
             e.path(),
             human_bytes(meta.size() as f64)
         );
     }
+
+    assert_eq!(sst_count, 1);
+    assert_eq!(vlog_count, 1);
 }
 
 #[test]
@@ -610,7 +622,7 @@ fn test_db_growth() {
     opts.num_level_zero_tables = 1;
     opts.num_level_zero_tables_stall = 2;
     let db = opts.open().unwrap();
-    for num_writes in 0..max_writes {
+    for _ in 0..max_writes {
         let mut txn = db.new_transaction(true);
         if start > 0 {
             for i in last_start..start {
@@ -638,5 +650,19 @@ fn test_db_growth() {
             }
         }
         txn.commit().unwrap();
+        db.flatten(1).unwrap();
+
+        loop {
+            match db.core.run_value_log_gc(discard_ratio) {
+                Err(Error::ErrNoRewrite) => {
+                    break;
+                }
+                Err(_) => unreachable!(),
+                _ => {}
+            }
+        }
+
+        last_start = start;
+        start += num_keys;
     }
 }
