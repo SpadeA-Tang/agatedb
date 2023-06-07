@@ -125,6 +125,7 @@ impl LevelHandler {
         }
 
         self.total_size += table.size();
+        println!("add tablet to l0 {}, size {}", table.id(), table.size());
         self.tables.push(table);
 
         true

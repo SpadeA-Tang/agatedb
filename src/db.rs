@@ -244,9 +244,9 @@ impl Agate {
     }
 
     // todo(spadea): review it.
-    fn stop_compaction(&self) {
+    pub(crate) fn stop_compaction(&self) {
         self.closer.close();
-        for i in 0..self.core.opts.num_compactors {
+        for _ in 0..self.core.opts.num_compactors {
             self.closer.wait_done();
         }
     }
@@ -844,6 +844,7 @@ impl Core {
         // spadea(todo): port span
         let log_file = log_file.read().unwrap();
         let fid = log_file.file_id();
+        info!("vlog gc, lock file {} is picked", fid);
         self.rewrite(&log_file)?;
         // Remove the file from discardStats.
         self.value_log().discard_stats().update(fid, -1);
@@ -854,7 +855,7 @@ impl Core {
         let inner = self.vlog.value_log().inner().read().unwrap();
         let fid = log_file.file_id();
         if inner.files_to_delete().iter().any(|id| *id == fid) {
-            return Err(Error::Other(format!(
+            return Err(Error::CustomError(format!(
                 "value log file already marked for deletion fid {}",
                 fid
             )));
@@ -885,7 +886,7 @@ impl Core {
             // Value is still present in value log
 
             if val.value.is_empty() {
-                return Err(Error::Other(format!("Empty value {:?}", val)));
+                return Err(Error::CustomError(format!("Empty value {:?}", val)));
             }
 
             let mut vp = ValuePointer::default();
@@ -1018,7 +1019,7 @@ impl Core {
         let mut inner = self.vlog.value_log().inner().write().unwrap();
         let mut delete_file_now = false;
         if inner.files_map().get(&fid).is_none() {
-            return Err(Error::Other(format!("Unable to find fid {}", fid)));
+            return Err(Error::CustomError(format!("Unable to find fid {}", fid)));
         }
 
         // no other object holding it

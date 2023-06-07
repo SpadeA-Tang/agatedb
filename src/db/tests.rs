@@ -9,7 +9,7 @@ use super::*;
 use crate::{
     entry::Entry,
     format::{append_ts, key_with_ts},
-    test_tuil::{txn_delete, txn_set},
+    test_tuil::{dir_size, txn_delete, txn_set},
     IteratorOptions,
 };
 
@@ -605,6 +605,7 @@ fn test_value_gc_managed() {
 #[test]
 fn test_db_growth() {
     let dir = tempdir::TempDir::new("agate-test").unwrap();
+    let path_str = dir.path().to_str().unwrap();
 
     let mut start = 0;
     let mut last_start = 0;
@@ -621,7 +622,7 @@ fn test_db_growth() {
     opts.num_versions_to_keep = 1;
     opts.num_level_zero_tables = 1;
     opts.num_level_zero_tables_stall = 2;
-    let db = opts.open().unwrap();
+    let mut db = opts.open().unwrap();
     for _ in 0..max_writes {
         let mut txn = db.new_transaction(true);
         if start > 0 {
@@ -657,12 +658,19 @@ fn test_db_growth() {
                 Err(Error::ErrNoRewrite) => {
                     break;
                 }
-                Err(_) => unreachable!(),
+                Err(e) => panic!("meet error {:?}", e),
                 _ => {}
             }
         }
 
+        let size = dir_size(path_str).unwrap();
+        println!("Agate DB Size = {}MB", size);
         last_start = start;
         start += num_keys;
     }
+
+    drop(db);
+    let size = dir_size(path_str).unwrap();
+    assert!(size < 70);
+    println!("Agate DB Size = {}MB", size);
 }
