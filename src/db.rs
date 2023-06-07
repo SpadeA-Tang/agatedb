@@ -149,6 +149,44 @@ impl Agate {
         self.core.write_requests(request)
     }
 
+    // Triggers a value log garbage collection.
+    //
+    // It picks value log files to perform GC based on statistics that are collected
+    // during compactions.  If no such statistics are available, then log files are
+    // picked in random order. The process stops as soon as the first log file is
+    // encountered which does not result in garbage collection.
+    //
+    // When a log file is picked, it is first sampled. If the sample shows that we
+    // can discard at least discardRatio space of that file, it would be rewritten.
+    //
+    // If a call to run_value_log_gc results in no rewrites, then an ErrNoRewrite is
+    // thrown indicating that the call resulted in no file rewrites.
+    //
+    // We recommend setting discardRatio to 0.5, thus indicating that a file be
+    // rewritten if half the space can be discarded.  This results in a lifetime
+    // value log write amplification of 2 (1 from original write + 0.5 rewrite +
+    // 0.25 + 0.125 + ... = 2). Setting it to higher value would result in fewer
+    // space reclaims, while setting it to a lower value would result in more space
+    // reclaims at the cost of increased activity on the LSM tree. discardRatio
+    // must be in the range (0.0, 1.0), both endpoints excluded, otherwise an
+    // ErrInvalidRequest is returned.
+    //
+    // Only one GC is allowed at a time. If another value log GC is running, or DB
+    // has been closed, this would return an ErrRejected.
+    //
+    // Note: Every time GC is run, it would produce a spike of activity on the LSM
+    // tree.
+    pub fn run_value_log_gc(&self, discard_ratio: f64) -> Result<()> {
+        if self.core.opts.in_memory {
+            return Err(Error::ErrGCInMemoryMode);
+        }
+        if discard_ratio >= 1.0 || discard_ratio <= 0.0 {
+            return Err(Error::ErrInvalidRequest);
+        }
+
+        self.core.run_gc(discard_ratio)
+    }
+
     pub fn flatten(&mut self, workers: u64) -> Result<()> {
         self.stop_compaction();
         let ret = self.flatten_impl(workers);
@@ -782,44 +820,6 @@ impl Core {
 
     pub(crate) fn value_log(&self) -> &ValueLog {
         self.vlog.as_ref().as_ref().unwrap()
-    }
-
-    // Triggers a value log garbage collection.
-    //
-    // It picks value log files to perform GC based on statistics that are collected
-    // during compactions.  If no such statistics are available, then log files are
-    // picked in random order. The process stops as soon as the first log file is
-    // encountered which does not result in garbage collection.
-    //
-    // When a log file is picked, it is first sampled. If the sample shows that we
-    // can discard at least discardRatio space of that file, it would be rewritten.
-    //
-    // If a call to run_value_log_gc results in no rewrites, then an ErrNoRewrite is
-    // thrown indicating that the call resulted in no file rewrites.
-    //
-    // We recommend setting discardRatio to 0.5, thus indicating that a file be
-    // rewritten if half the space can be discarded.  This results in a lifetime
-    // value log write amplification of 2 (1 from original write + 0.5 rewrite +
-    // 0.25 + 0.125 + ... = 2). Setting it to higher value would result in fewer
-    // space reclaims, while setting it to a lower value would result in more space
-    // reclaims at the cost of increased activity on the LSM tree. discardRatio
-    // must be in the range (0.0, 1.0), both endpoints excluded, otherwise an
-    // ErrInvalidRequest is returned.
-    //
-    // Only one GC is allowed at a time. If another value log GC is running, or DB
-    // has been closed, this would return an ErrRejected.
-    //
-    // Note: Every time GC is run, it would produce a spike of activity on the LSM
-    // tree.
-    pub fn run_value_log_gc(&self, discard_ratio: f64) -> Result<()> {
-        if self.opts.in_memory {
-            return Err(Error::ErrGCInMemoryMode);
-        }
-        if discard_ratio >= 1.0 || discard_ratio <= 0.0 {
-            return Err(Error::ErrInvalidRequest);
-        }
-
-        self.run_gc(discard_ratio)
     }
 
     fn run_gc(&self, discard_ratio: f64) -> Result<()> {
