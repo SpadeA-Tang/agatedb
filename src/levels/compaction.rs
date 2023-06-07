@@ -281,7 +281,7 @@ impl CompactStatus {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CompactionPriority {
     pub level: usize,
     pub score: f64,
@@ -290,7 +290,7 @@ pub struct CompactionPriority {
     pub targets: Targets,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Targets {
     pub base_level: usize,
     pub target_size: Vec<u64>,

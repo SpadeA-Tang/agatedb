@@ -12,8 +12,6 @@ use crate::value::ValuePointer;
 
 #[derive(Debug, Error, Clone)]
 pub enum Error {
-    #[error("Other error: {0}")]
-    Other(String),
     #[error("Invalid Configuration: {0}")]
     Config(String),
     #[error("IO error: {0}")]

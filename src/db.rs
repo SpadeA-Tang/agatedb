@@ -6,13 +6,15 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, RwLock, RwLockReadGuard,
+        mpsc::sync_channel,
+        Arc, Mutex, RwLock, RwLockReadGuard,
     },
     thread::JoinHandle,
 };
 
 use bytes::{Bytes, BytesMut};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
+use human_bytes::human_bytes;
 use log::{debug, info, warn};
 pub use opt::AgateOptions;
 use skiplist::Skiplist;
@@ -20,10 +22,11 @@ use yatp::task::callback::Handle;
 
 use crate::{
     closer::Closer,
+    defer,
     entry::{Entry, EntryRef},
     get_ts,
     iterator::is_deleted_or_expired,
-    levels::LevelsController,
+    levels::{CompactionPriority, LevelsController},
     manifest::ManifestFile,
     memtable::{MemTable, MemTables},
     ops::oracle::Oracle,
@@ -145,6 +148,155 @@ impl Agate {
     pub fn write_requests(&self, request: Vec<Request>) -> Result<()> {
         self.core.write_requests(request)
     }
+
+    // Triggers a value log garbage collection.
+    //
+    // It picks value log files to perform GC based on statistics that are collected
+    // during compactions.  If no such statistics are available, then log files are
+    // picked in random order. The process stops as soon as the first log file is
+    // encountered which does not result in garbage collection.
+    //
+    // When a log file is picked, it is first sampled. If the sample shows that we
+    // can discard at least discardRatio space of that file, it would be rewritten.
+    //
+    // If a call to run_value_log_gc results in no rewrites, then an ErrNoRewrite is
+    // thrown indicating that the call resulted in no file rewrites.
+    //
+    // We recommend setting discardRatio to 0.5, thus indicating that a file be
+    // rewritten if half the space can be discarded.  This results in a lifetime
+    // value log write amplification of 2 (1 from original write + 0.5 rewrite +
+    // 0.25 + 0.125 + ... = 2). Setting it to higher value would result in fewer
+    // space reclaims, while setting it to a lower value would result in more space
+    // reclaims at the cost of increased activity on the LSM tree. discardRatio
+    // must be in the range (0.0, 1.0), both endpoints excluded, otherwise an
+    // ErrInvalidRequest is returned.
+    //
+    // Only one GC is allowed at a time. If another value log GC is running, or DB
+    // has been closed, this would return an ErrRejected.
+    //
+    // Note: Every time GC is run, it would produce a spike of activity on the LSM
+    // tree.
+    pub fn run_value_log_gc(&self, discard_ratio: f64) -> Result<()> {
+        if self.core.opts.in_memory {
+            return Err(Error::ErrGCInMemoryMode);
+        }
+        if discard_ratio >= 1.0 || discard_ratio <= 0.0 {
+            return Err(Error::ErrInvalidRequest);
+        }
+
+        self.core.run_gc(discard_ratio)
+    }
+
+    pub fn flatten(&mut self, workers: u64) -> Result<()> {
+        self.stop_compaction();
+        let ret = self.flatten_impl(workers);
+        self.start_compaction();
+        ret
+    }
+
+    // Flatten can be used to force compactions on the LSM tree so all the tables fall on the same
+    // level. This ensures that all the versions of keys are colocated and not split across multiple
+    // levels, which is necessary after a restore from backup. During Flatten, live compactions are
+    // stopped. Ideally, no writes are going on during Flatten. Otherwise, it would create competition
+    // between flattening the tree and new tables being created at level zero.
+    fn flatten_impl(&self, workers: u64) -> Result<()> {
+        let compact_away = |cp: CompactionPriority| -> Result<()> {
+            info!("Attempting to compact with {:?}", cp);
+            let (tx, rx) = sync_channel(1);
+            let tx = Arc::new(Mutex::new(tx));
+
+            let mut handles = vec![];
+            for _ in 0..workers {
+                let tx_clone = tx.clone();
+                let core = self.core.clone();
+                let pool_clone = self.pool.clone();
+                let cp_clone = cp.clone();
+                handles.push(std::thread::spawn(move || {
+                    tx_clone
+                        .lock()
+                        .unwrap()
+                        .send(core.lvctl.inner.do_compact(175, cp_clone, pool_clone))
+                        .unwrap();
+                }));
+            }
+
+            let mut success = 0;
+            let mut rerr = None;
+            for _ in 0..workers {
+                match rx.recv().unwrap() {
+                    Err(e) => {
+                        warn!("While running doCompact with {:?}. Error: {:?}", cp, e);
+                        rerr = Some(e);
+                    }
+                    Ok(_) => success += 1,
+                }
+            }
+            if success == 0 {
+                return Err(rerr.unwrap());
+            }
+
+            info!(
+                "{} compactor(s) succeeded. One or more tables from level {} compacted.",
+                success, cp.level
+            );
+
+            Ok(())
+        };
+
+        let hbytes = |sz| -> String { human_bytes(sz as f64) };
+
+        let t = self.core.lvctl.inner.level_targets();
+        loop {
+            info!("");
+            let mut levels = vec![];
+            for (i, l) in self.core.lvctl.inner.levels.iter().enumerate() {
+                let sz = l.read().unwrap().total_size;
+                info!(
+                    "Level: {}. {} Size. {} Max.",
+                    i,
+                    hbytes(sz),
+                    hbytes(t.target_size[i])
+                );
+                if sz > 0 {
+                    levels.push(i);
+                }
+            }
+            if levels.len() <= 1 {
+                let prios = self.core.lvctl.inner.pick_compact_levels();
+                if prios.is_empty() || prios[0].score < 1.0 {
+                    info!("All tables consolidated into one level. Flattening done.");
+                    return Ok(());
+                }
+                compact_away(prios[0].clone())?;
+                continue;
+            }
+
+            // Create an artificial compaction priority, to ensure that we compact the level.
+            let cp = CompactionPriority {
+                level: levels[0],
+                score: 1.71,
+                ..Default::default()
+            };
+            compact_away(cp)?;
+        }
+    }
+
+    // todo(spadea): review it.
+    pub(crate) fn stop_compaction(&self) {
+        self.closer.close();
+        for _ in 0..self.core.opts.num_compactors {
+            self.closer.wait_done();
+        }
+    }
+
+    fn start_compaction(&mut self) {
+        assert!(!self.closer.is_some());
+        let closer = Closer::new();
+        self.core
+            .lvctl
+            .start_compact(closer.clone(), self.pool.clone());
+        self.closer = closer;
+    }
 }
 
 impl Drop for Agate {
@@ -169,7 +321,13 @@ impl Core {
         // create first mem table
         let orc = Arc::new(Oracle::new(opts));
         let manifest = Arc::new(ManifestFile::open_or_create_manifest_file(opts)?);
-        let lvctl = LevelsController::new(opts, manifest.clone(), orc.clone())?;
+
+        let mut discard_stats = None;
+        let vlog = ValueLog::new(opts.clone())?;
+        if let Some(ref vlog) = vlog {
+            discard_stats = Some(vlog.discard_stats().clone());
+        }
+        let lvctl = LevelsController::new(opts, manifest.clone(), orc.clone(), discard_stats)?;
 
         let (imm_tables, mut next_mem_fid) = Self::open_mem_tables(opts)?;
         let mt = Self::open_mem_table(opts, next_mem_fid)?;
@@ -184,7 +342,7 @@ impl Core {
             opts: opts.clone(),
             manifest,
             lvctl,
-            vlog: ValueLogWrapper(Arc::new(ValueLog::new(opts.clone())?)),
+            vlog: ValueLogWrapper(Arc::new(vlog)),
             write_channel: bounded(KV_WRITE_CH_CAPACITY),
             flush_channel: crossbeam_channel::bounded(opts.num_memtables),
             block_writes: AtomicBool::new(false),
@@ -664,44 +822,6 @@ impl Core {
         self.vlog.as_ref().as_ref().unwrap()
     }
 
-    // Triggers a value log garbage collection.
-    //
-    // It picks value log files to perform GC based on statistics that are collected
-    // during compactions.  If no such statistics are available, then log files are
-    // picked in random order. The process stops as soon as the first log file is
-    // encountered which does not result in garbage collection.
-    //
-    // When a log file is picked, it is first sampled. If the sample shows that we
-    // can discard at least discardRatio space of that file, it would be rewritten.
-    //
-    // If a call to run_value_log_gc results in no rewrites, then an ErrNoRewrite is
-    // thrown indicating that the call resulted in no file rewrites.
-    //
-    // We recommend setting discardRatio to 0.5, thus indicating that a file be
-    // rewritten if half the space can be discarded.  This results in a lifetime
-    // value log write amplification of 2 (1 from original write + 0.5 rewrite +
-    // 0.25 + 0.125 + ... = 2). Setting it to higher value would result in fewer
-    // space reclaims, while setting it to a lower value would result in more space
-    // reclaims at the cost of increased activity on the LSM tree. discardRatio
-    // must be in the range (0.0, 1.0), both endpoints excluded, otherwise an
-    // ErrInvalidRequest is returned.
-    //
-    // Only one GC is allowed at a time. If another value log GC is running, or DB
-    // has been closed, this would return an ErrRejected.
-    //
-    // Note: Every time GC is run, it would produce a spike of activity on the LSM
-    // tree.
-    pub fn run_value_log_gc(&self, discard_ratio: f64) -> Result<()> {
-        if self.opts.in_memory {
-            return Err(Error::ErrGCInMemoryMode);
-        }
-        if discard_ratio >= 1.0 || discard_ratio <= 0.0 {
-            return Err(Error::ErrInvalidRequest);
-        }
-
-        self.run_gc(discard_ratio)
-    }
-
     fn run_gc(&self, discard_ratio: f64) -> Result<()> {
         // spadea(todo): downgrade ordering
         let _ = self
@@ -709,20 +829,22 @@ impl Core {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| Error::ErrRejected)?;
 
+        defer!({
+            self.gc_running.store(false, Ordering::SeqCst);
+        });
+
         let lf = self
             .value_log()
             .pick_log(discard_ratio)
             .ok_or(Error::ErrNoRewrite)?;
-        let gc_result = self.do_run_gc(lf);
-
-        self.gc_running.store(false, Ordering::SeqCst);
-        gc_result
+        self.do_run_gc(lf)
     }
 
     fn do_run_gc(&self, log_file: Arc<RwLock<Wal>>) -> Result<()> {
         // spadea(todo): port span
         let log_file = log_file.read().unwrap();
         let fid = log_file.file_id();
+        info!("vlog gc, lock file {} is picked", fid);
         self.rewrite(&log_file)?;
         // Remove the file from discardStats.
         self.value_log().discard_stats().update(fid, -1);
@@ -733,7 +855,7 @@ impl Core {
         let inner = self.vlog.value_log().inner().read().unwrap();
         let fid = log_file.file_id();
         if inner.files_to_delete().iter().any(|id| *id == fid) {
-            return Err(Error::Other(format!(
+            return Err(Error::CustomError(format!(
                 "value log file already marked for deletion fid {}",
                 fid
             )));
@@ -764,7 +886,7 @@ impl Core {
             // Value is still present in value log
 
             if val.value.is_empty() {
-                return Err(Error::Other(format!("Empty value {:?}", val)));
+                return Err(Error::CustomError(format!("Empty value {:?}", val)));
             }
 
             let mut vp = ValuePointer::default();
@@ -897,7 +1019,7 @@ impl Core {
         let mut inner = self.vlog.value_log().inner().write().unwrap();
         let mut delete_file_now = false;
         if inner.files_map().get(&fid).is_none() {
-            return Err(Error::Other(format!("Unable to find fid {}", fid)));
+            return Err(Error::CustomError(format!("Unable to find fid {}", fid)));
         }
 
         // no other object holding it

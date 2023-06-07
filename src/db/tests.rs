@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fs::read_dir, os::unix::prelude::MetadataExt, path::Path};
 
 use bytes::{Bytes, BytesMut};
 use rand::distributions::{Alphanumeric, DistString};
@@ -9,7 +9,7 @@ use super::*;
 use crate::{
     entry::Entry,
     format::{append_ts, key_with_ts},
-    test_tuil::{txn_delete, txn_set},
+    test_tuil::{dir_size, txn_delete, txn_set},
     IteratorOptions,
 };
 
@@ -511,4 +511,166 @@ fn test_value_gc4() {
         })
         .unwrap();
     }
+}
+
+#[test]
+fn test_value_gc_managed() {
+    let dir = tempdir::TempDir::new("agate-test").unwrap();
+    let n = 10000;
+
+    let mut opts = AgateOptions::default_for_test(dir.path());
+    opts.value_log_max_entries = n / 10;
+    opts.managed_txns = true;
+    opts.base_table_size = 1 << 15;
+    opts.value_threshold = 1 << 10;
+    opts.mem_table_size = 1 << 15;
+
+    let mut db = opts.open().unwrap();
+    let mut ts = 0;
+    let mut new_ts = || -> u64 {
+        ts += 1;
+        ts
+    };
+
+    let sz = 64 << 10;
+    for i in 0..n {
+        let value = Bytes::from(Alphanumeric.sample_string(&mut rand::thread_rng(), sz));
+        let mut txn = db.new_transaction_at(new_ts(), true);
+        txn.set_entry(Entry::new(Bytes::from(format!("key{:03}", i)), value))
+            .unwrap();
+        txn.commit_at(new_ts()).unwrap();
+    }
+
+    for i in 0..n {
+        let mut txn = db.new_transaction_at(new_ts(), true);
+        txn.delete(Bytes::from(format!("key{:03}", i))).unwrap();
+        txn.commit_at(new_ts()).unwrap();
+    }
+
+    let mut entries = read_dir(dir.path()).unwrap();
+    while let Some(Ok(e)) = entries.next() {
+        let meta = e.metadata().unwrap();
+        info!(
+            "File {:?}. Size {:?}.",
+            e.path(),
+            human_bytes(meta.size() as f64)
+        );
+    }
+
+    db.set_discard_ts(u32::MAX as u64);
+    db.flatten(3).unwrap();
+
+    info!("After flatten");
+    let mut entries = read_dir(dir.path()).unwrap();
+    while let Some(Ok(e)) = entries.next() {
+        let meta = e.metadata().unwrap();
+        info!(
+            "File {:?}. Size {:?}.",
+            e.path(),
+            human_bytes(meta.size() as f64)
+        );
+    }
+
+    for _ in 0..100 {
+        // Try at max 100 times to GC even a single value log file.
+        if let Err(_) = db.core.run_value_log_gc(0.0001) {
+            break;
+        }
+    }
+
+    info!("After gc");
+    let mut entries = read_dir(dir.path()).unwrap();
+    // now, we should only have one .sst and one .vlog file.
+    let mut sst_count = 0;
+    let mut vlog_count = 0;
+    while let Some(Ok(e)) = entries.next() {
+        if e.file_name().to_str().unwrap().ends_with(".sst") {
+            sst_count += 1;
+        }
+        if e.file_name().to_str().unwrap().ends_with(".vlog") {
+            vlog_count += 1;
+        }
+        let meta = e.metadata().unwrap();
+        info!(
+            "File {:?}. Size {:?}.",
+            e.path(),
+            human_bytes(meta.size() as f64)
+        );
+    }
+
+    assert_eq!(sst_count, 1);
+    assert_eq!(vlog_count, 1);
+}
+
+#[test]
+fn test_db_growth() {
+    let dir = tempdir::TempDir::new("agate-test").unwrap();
+    let path_str = dir.path().to_str().unwrap();
+
+    let mut start = 0;
+    let mut last_start = 0;
+    let num_keys = 2000;
+    let value_size = 1024;
+    let value = Bytes::from(Alphanumeric.sample_string(&mut rand::thread_rng(), value_size));
+
+    let discard_ratio = 0.001;
+    let max_writes = 200;
+    let mut opts = AgateOptions::default_for_test(dir.path());
+    opts.value_log_file_size = 64 << 15;
+    opts.base_table_size = 4 << 15;
+    opts.base_level_size = 16 << 15;
+    opts.num_versions_to_keep = 1;
+    opts.num_level_zero_tables = 1;
+    opts.num_level_zero_tables_stall = 2;
+    let mut db = opts.open().unwrap();
+    for _ in 0..max_writes {
+        let mut txn = db.new_transaction(true);
+        if start > 0 {
+            for i in last_start..start {
+                let key = Bytes::from(format!("{:?}", i));
+                match txn.delete(key) {
+                    Err(Error::TxnTooBig) => {
+                        txn.commit().unwrap();
+                        txn = db.new_transaction(true);
+                    }
+                    Err(_) => unreachable!(),
+                    _ => {}
+                }
+            }
+        }
+
+        for i in start..start + num_keys {
+            let key = Bytes::from(format!("{:?}", i));
+            match txn.set_entry(Entry::new(key, value.clone())) {
+                Err(Error::TxnTooBig) => {
+                    txn.commit().unwrap();
+                    txn = db.new_transaction(true);
+                }
+                Err(_) => unreachable!(),
+                _ => {}
+            }
+        }
+        txn.commit().unwrap();
+        db.flatten(1).unwrap();
+
+        loop {
+            match db.core.run_value_log_gc(discard_ratio) {
+                Err(Error::ErrNoRewrite) => {
+                    break;
+                }
+                Err(e) => panic!("meet error {:?}", e),
+                _ => {}
+            }
+        }
+
+        let size = dir_size(path_str).unwrap();
+        println!("Agate DB Size = {}MB", size);
+        last_start = start;
+        start += num_keys;
+    }
+
+    drop(db);
+    let size = dir_size(path_str).unwrap();
+    assert!(size < 70);
+    println!("Agate DB Size = {}MB", size);
 }

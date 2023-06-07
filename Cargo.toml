@@ -17,6 +17,7 @@ crossbeam-channel = "0.5"
 enum_dispatch = "0.3"
 farmhash = "1.1"
 getset = "0.1.2"
+human_bytes = "0.4.2"
 indexsort = "0.1.0"
 lazy_static = "1.4.0"
 log = "0.4.17"
@@ -29,6 +30,7 @@ rocksdb = { version = "0.15", optional = true }
 skiplist = { path = "skiplist" }
 tempdir = "0.3"
 thiserror = "1.0"
+walkdir = "2"
 yatp = { git = "https://github.com/tikv/yatp.git", rev = "b793461ea4abd202798cda6e20e97a054103f2ad" }
 
 [dev-dependencies]

@@ -50,7 +50,7 @@ where
         let manifest = Arc::new(ManifestFile::open_or_create_manifest_file(&opts).unwrap());
         let orc = Arc::new(Oracle::new(&opts));
 
-        let mut lvctl = LevelsController::new(&opts, manifest, orc).unwrap();
+        let mut lvctl = LevelsController::new(&opts, manifest, orc, None).unwrap();
 
         f(&mut lvctl);
 
