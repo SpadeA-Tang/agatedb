@@ -573,7 +573,7 @@ fn test_value_gc_managed() {
 
     for _ in 0..100 {
         // Try at max 100 times to GC even a single value log file.
-        if let Err(_) = db.core.run_value_log_gc(0.0001) {
+        if let Err(_) = db.run_value_log_gc(0.0001) {
             break;
         }
     }
@@ -654,7 +654,7 @@ fn test_db_growth() {
         db.flatten(1).unwrap();
 
         loop {
-            match db.core.run_value_log_gc(discard_ratio) {
+            match db.run_value_log_gc(discard_ratio) {
                 Err(Error::ErrNoRewrite) => {
                     break;
                 }
