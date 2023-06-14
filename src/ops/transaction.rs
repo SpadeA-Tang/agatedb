@@ -87,11 +87,7 @@ impl Transaction {
         let mut entries: Vec<_> = self.pending_writes.values().cloned().collect();
         entries.sort_by(|x, y| {
             let cmp = COMPARATOR.compare_key(&x.key, &y.key);
-            if reversed {
-                cmp.reverse()
-            } else {
-                cmp
-            }
+            if reversed { cmp.reverse() } else { cmp }
         });
 
         Some(PendingWritesIterator::new(self.read_ts, reversed, entries))
@@ -279,7 +275,10 @@ impl Transaction {
         }
     }
 
-    fn commit_and_send(&mut self) -> Result<()> {
+    fn commit_and_send(&mut self) -> Result<F>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         let orc = self.core.orc.clone();
         // Ensure that the order in which we get the commit timestamp is the same as
         // the order in which we push these updates to the write channel. So, we
@@ -354,11 +353,12 @@ impl Transaction {
 
         drop(write_ch_lock);
 
-        let done = done.unwrap();
-        let ret = done.recv().unwrap();
-        orc.done_commit(commit_ts);
-
-        ret
+        Ok(|| -> Result<()> {
+            let done = done.unwrap();
+            let ret = done.recv().unwrap();
+            orc.done_commit(commit_ts);
+            ret
+        })
     }
 
     fn commit_precheck(&self) -> Result<()> {
@@ -407,10 +407,57 @@ impl Transaction {
 
         self.commit_precheck()?;
 
-        self.commit_and_send()?;
+        let txn_cb = self.commit_and_send()?;
         // TODO: Callback.
 
         Ok(())
+    }
+
+    // Commits the transaction, following the same logic as commit(), but
+    // at the given commit timestamp. This will panic if not used with managed transactions.
+    //
+    // This is only useful for databases built on top of Agate, and
+    // can be ignored by most users.
+    pub(crate) fn commit_at(mut self, commit_ts: u64, callback: Option<F>) -> Result<()>
+    where
+        F: FnOnce(Result<()>),
+    {
+        if !self.core.opts.managed_txns {
+            panic!("Cannot use commit_at with managedDB=false. Use commit instead.")
+        }
+
+        self.commit_ts = commit_ts;
+        if callback.is_none() {
+            return self.commit();
+        }
+
+        self.commit_with(callback);
+        Ok(())
+    }
+
+    // commit_with acts like commit, but takes a callback, which gets run via a
+    // goroutine to avoid blocking this function. The callback is guaranteed to run,
+    // so it is safe to increment sync.WaitGroup before calling commit_with, and
+    // decrementing it in the callback; to block until all callbacks are run.
+    pub(crate) fn commit_with(self, callback: Option<F>)
+    where
+        F: FnOnce(Result<()>),
+    {
+        if callback.is_none() {
+            panic!("None callback provided to commit_with");
+        }
+
+        if self.pending_writes.is_empty() {
+            // todo
+            return;
+        }
+
+        if let Err(e) = self.commit_precheck() {
+            callback(Err(e));
+            return;
+        }
+
+        self.commit_and_send()
     }
 }
 
