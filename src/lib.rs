@@ -4,6 +4,7 @@ mod batch;
 mod bloom;
 mod checksum;
 mod closer;
+mod compaction_iterator;
 mod db;
 mod discard;
 mod entry;
