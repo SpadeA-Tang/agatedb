@@ -1,4 +1,4 @@
-use crate::{format::user_key, iterator::is_deleted_or_expired, AgateIterator, Value};
+use crate::{format::user_key, get_ts, iterator::is_deleted_or_expired, AgateIterator, Value};
 
 pub struct CompactionIterator<'a, I: AgateIterator> {
     valid: bool,
@@ -10,6 +10,7 @@ pub struct CompactionIterator<'a, I: AgateIterator> {
 
     current_user_key_sequence: u64,
     current_user_key_snapshot: u64,
+    snapshots: Vec<u64>,
 
     iter_stats: CompactionIterationStats,
 }
@@ -40,7 +41,33 @@ impl<'a, I: AgateIterator> CompactionIterator<'a, I> {
                 self.current_user_key_snapshot = 0;
                 self.current_user_key = Some(user_key);
             }
+
+            let last_sequence = self.current_user_key_sequence;
+            self.current_user_key_sequence = get_ts(self.key);
+            let last_snapshot = self.current_user_key_snapshot;
+            let (prev_snapshot, current_user_key_snaphsot) =
+                self.find_earlist_visible_snaphsot(self.current_user_key_sequence);
+            self.current_user_key_snapshot = current_user_key_snaphsot;
+
+            if need_skip {
+            } else if last_snapshot == self.current_user_key_snapshot
+                || (last_snapshot > 0 && last_snapshot < self.current_user_key_snapshot)
+            {
+                assert!(last_sequence >= self.current_user_key_sequence);
+                if last_sequence < self.current_user_key_sequence {
+                    panic!("");
+                }
+
+                self.iter_stats.num_record_drop_hidden += 1;
+                self.input.next();
+            } else {
+                self.valid = true;
+            }
         }
+    }
+
+    fn find_earlist_visible_snaphsot(&self, sequence: u64) -> (u64, u64) {
+        unimplemented!()
     }
 }
 
