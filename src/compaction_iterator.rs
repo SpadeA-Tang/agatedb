@@ -1,6 +1,4 @@
-use std::collections::HashSet;
-
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use indexing::algorithms::lower_bound;
 use log::info;
 
@@ -43,15 +41,18 @@ impl<I: AgateIterator> CompactionIterator<I> {
         self.valid
     }
 
-    pub fn key(&self) -> Bytes {
-        self.key.clone()
+    pub fn key(&self) -> &Bytes {
+        &self.key
+    }
+
+    pub fn value(&self) -> &Value {
+        &self.value
     }
 
     fn next_from_input(&mut self) {
         self.valid = false;
         while !self.valid && self.input.valid() {
-            let key = self.input.key().to_vec();
-            self.key = Bytes::from(key);
+            self.key = Bytes::from(self.input.key().to_vec());
             // println!("key: {:?}", self.key);
             self.value = self.input.value();
             if is_deleted_or_expired(self.value.meta, self.value.expires_at) {
@@ -62,7 +63,7 @@ impl<I: AgateIterator> CompactionIterator<I> {
 
             // If need_skip is true, we should seek the input iterator
             // to internal key skip_until and continue from there.
-            let mut need_skip = false;
+            let _need_skip = false;
 
             let user_key = user_key(self.key.as_ref());
             // println!("user key: {:?}", String::from_utf8(user_key.to_vec()));
@@ -80,14 +81,22 @@ impl<I: AgateIterator> CompactionIterator<I> {
             let last_sequence = self.current_user_key_sequence;
             self.current_user_key_sequence = get_ts(self.key.as_ref());
             let last_snapshot = self.current_user_key_snapshot;
-            let (prev_snapshot, current_user_key_snaphsot) =
+            let (_prev_snapshot, current_user_key_snaphsot) =
                 self.find_earlist_visible_snaphsot(self.current_user_key_sequence);
             self.current_user_key_snapshot = current_user_key_snaphsot;
 
-            if need_skip {
+            if _need_skip {
             } else if last_snapshot == self.current_user_key_snapshot
                 || (last_snapshot > 0 && last_snapshot < self.current_user_key_snapshot)
             {
+                // If the earliest snapshot is which this key is visible in
+                // is the same as the visibility of a previous instance of the
+                // same key, then this kv is not visible in any snapshot.
+                // Hidden by an newer entry for same user key
+                //
+                // Note: Dropping this key will not affect TransactionDB write-conflict
+                // checking since there has already been a record returned for this key
+                // in this snapshot.
                 assert!(last_sequence >= self.current_user_key_sequence);
                 if last_sequence < self.current_user_key_sequence {
                     panic!("");
@@ -119,7 +128,7 @@ impl<I: AgateIterator> CompactionIterator<I> {
     }
 
     fn find_earlist_visible_snaphsot(&self, sequence: u64) -> (u64, u64) {
-        if self.snapshots.len() == 0 {
+        if self.snapshots.is_empty() {
             info!("No snapshot left in findEarliestVisibleSnapshot");
         }
         let mut prev_snapshot = 0;
@@ -174,10 +183,10 @@ pub struct CompactionIterationStats {
 
 #[cfg(test)]
 mod test {
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
     use skiplist::{FixedLengthSuffixComparator, Skiplist};
 
-    use crate::{iterator::SkiplistIterator, key_with_ts};
+    use crate::{iterator::SkiplistIterator, key_with_ts, value::VALUE_DELETE};
 
     use super::*;
 
@@ -185,7 +194,7 @@ mod test {
 
     #[test]
     fn test_compaction_iter() {
-        let xx = |allow_concurrent_write| {
+        let test_iter = |allow_concurrent_write, snapshots, expect_count, delete_others| {
             let comp = FixedLengthSuffixComparator::new(8);
             let list = Skiplist::with_capacity(comp, ARENA_SIZE, allow_concurrent_write);
             for i in 0..10 {
@@ -198,25 +207,38 @@ mod test {
                     val.value = value;
                     val.version = t;
 
+                    if delete_others && t != 5 {
+                        val.meta |= VALUE_DELETE;
+                    }
+
                     let mut enc_val = BytesMut::default();
                     val.encode(&mut enc_val);
                     list.put(key, enc_val);
                 }
             }
             let iter = SkiplistIterator::new(list.iter(), false);
-            let mut c_iter = CompactionIterator::new(iter, vec![]);
+            let mut c_iter = CompactionIterator::new(iter, snapshots);
 
             c_iter.seek_to_first();
+            let mut count = 0;
             while c_iter.valid() {
-                let key = c_iter.key();
-                let u_key = String::from_utf8(user_key(key.as_ref()).to_vec());
-                let ts = get_ts(key.as_ref());
-                println!("key {:?}, ts {}", u_key, ts);
-
+                count += 1;
                 c_iter.next();
+            }
+            assert_eq!(count, expect_count);
+            assert_eq!(
+                c_iter.iter_stats.num_record_drop_hidden,
+                50 - expect_count as u64
+            );
+
+            if delete_others {
+                assert_eq!(c_iter.iter_stats.num_input_deletion_records, 40);
             }
         };
 
-        xx(false);
+        test_iter(false, vec![], 10, true);
+        test_iter(true, vec![], 10, false);
+        test_iter(false, vec![2, 4], 30, true);
+        test_iter(false, vec![2, 4], 30, false);
     }
 }
