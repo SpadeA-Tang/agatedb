@@ -50,7 +50,12 @@ where
         let manifest = Arc::new(ManifestFile::open_or_create_manifest_file(&opts).unwrap());
         let orc = Arc::new(Oracle::new(&opts));
 
-        let mut lvctl = LevelsController::new(&opts, manifest, orc, None).unwrap();
+        let discard_stats = if !opts.in_memory {
+            Some(DiscardStats::init_discard_stats(opts.clone()).unwrap())
+        } else {
+            None
+        };
+        let mut lvctl = LevelsController::new(&opts, manifest, orc, discard_stats).unwrap();
 
         f(&mut lvctl);
 
