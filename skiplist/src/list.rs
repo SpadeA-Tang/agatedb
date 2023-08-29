@@ -106,6 +106,7 @@ impl<C: KeyComparator> Skiplist<C> {
     unsafe fn find_near(&self, key: &[u8], less: bool, allow_equal: bool) -> *const Node {
         let mut cursor: *const Node = self.inner.head.as_ptr();
         let mut level = self.height();
+        
         loop {
             let next_offset = (*cursor).next_offset(level);
             if next_offset == 0 {
