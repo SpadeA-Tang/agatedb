@@ -32,6 +32,7 @@ tempdir = "0.3"
 thiserror = "1.0"
 walkdir = "2"
 yatp = { git = "https://github.com/tikv/yatp.git", rev = "b793461ea4abd202798cda6e20e97a054103f2ad" }
+prometheus = { version = "0.13", features = ["nightly"] }
 
 [dev-dependencies]
 criterion = "0.3"

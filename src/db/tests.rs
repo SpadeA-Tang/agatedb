@@ -151,7 +151,7 @@ fn test_simple_get_put() {
         let req = Request {
             entries: vec![Entry::new(key.clone(), value)],
             ptrs: vec![],
-            done: None,
+            cb: Callback::default(),
         };
         agate.write_to_lsm(req).unwrap();
         let value = agate.get(&key).unwrap();
@@ -167,7 +167,7 @@ fn generate_requests(n: usize) -> Vec<Request> {
                 Bytes::from(i.to_string()),
             )],
             ptrs: vec![],
-            done: None,
+            cb: Callback::default(),
         })
         .collect()
 }

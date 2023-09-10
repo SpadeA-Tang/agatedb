@@ -10,6 +10,7 @@ use std::{
         Arc, Mutex, RwLock, RwLockReadGuard,
     },
     thread::JoinHandle,
+    time::Instant,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -32,7 +33,9 @@ use crate::{
     ops::oracle::Oracle,
     opt::build_table_options,
     util::{has_any_prefixes, make_comparator},
-    value::{self, Request, Value, ValuePointer, VALUE_FIN_TXN, VALUE_POINTER, VALUE_TXN},
+    value::{
+        self, Callback, Request, Value, ValuePointer, VALUE_FIN_TXN, VALUE_POINTER, VALUE_TXN,
+    },
     value_log::{ValueLog, ValueLogWrapper},
     wal::Wal,
     Error, Result, Table, TableBuilder, TableOptions,
@@ -662,7 +665,7 @@ impl Core {
         }
 
         #[allow(clippy::needless_collect)]
-        let dones: Vec<_> = requests.iter().map(|x| x.done.clone()).collect();
+        let dones: Vec<_> = requests.iter().map(|x| x.cb.clone()).collect();
 
         let write = || {
             if let Some(ref vlog) = **self.vlog {
@@ -693,8 +696,9 @@ impl Core {
 
         let result = write();
 
-        for done in dones.into_iter().flatten() {
-            done.send(result.clone()).unwrap();
+        let now = Instant::now();
+        for done in dones.into_iter() {
+            done.set_result(result.clone(), now.clone()).unwrap();
         }
 
         result
@@ -725,7 +729,7 @@ impl Core {
         let req = Request {
             entries,
             ptrs: vec![],
-            done: Some(tx),
+            cb: Callback::new(Some(tx)),
         };
         self.write_channel.0.send(req)?;
         Ok(rx)

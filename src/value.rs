@@ -1,4 +1,7 @@
-use std::io::{Cursor, Read};
+use std::{
+    io::{Cursor, Read},
+    time::Instant,
+};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crossbeam_channel::Sender;
@@ -6,6 +9,7 @@ use prost::{decode_length_delimiter, encode_length_delimiter, length_delimiter_l
 
 use crate::{
     entry::{Entry, EntryRef},
+    metrics::DB_WRITE_DURATION_HISTOGRAM,
     wal::Header,
     Error, Result,
 };
@@ -82,8 +86,7 @@ pub struct Request {
     pub entries: Vec<Entry>,
     /// Offset in vLog (will be updated upon processing the request)
     pub ptrs: Vec<ValuePointer>,
-    /// Use channel to notify that the value has been persisted to disk
-    pub done: Option<Sender<Result<()>>>,
+    pub cb: Callback,
 }
 
 /// `ValuePointer` records the position of value saved in value log.
@@ -109,6 +112,41 @@ impl ValuePointer {
 
     pub fn encoded_size() -> usize {
         std::mem::size_of::<u32>() * 3
+    }
+}
+
+#[derive(Clone)]
+pub struct Callback {
+    start: Instant,
+    /// Use channel to notify that the value has been persisted to disk
+    done: Option<Sender<Result<()>>>,
+}
+
+impl Default for Callback {
+    fn default() -> Self {
+        Callback::new(None)
+    }
+}
+
+impl Callback {
+    pub fn new(done: Option<Sender<Result<()>>>) -> Callback {
+        Self {
+            start: Instant::now(),
+            done,
+        }
+    }
+
+    //
+    pub fn set_result(self, r: Result<()>, t: Instant) -> Result<()> {
+        let dur = t - self.start;
+
+        DB_WRITE_DURATION_HISTOGRAM.observe(dur.as_secs_f64());
+
+        if let Some(done) = self.done {
+            done.send(r)?;
+        }
+
+        Ok(())
     }
 }
 

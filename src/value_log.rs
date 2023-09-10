@@ -500,7 +500,7 @@ mod tests {
     use value::VALUE_POINTER;
 
     use super::*;
-    use crate::entry::Entry;
+    use crate::{entry::Entry, value::Callback};
 
     #[test]
     fn test_value_basic() {
@@ -530,7 +530,7 @@ mod tests {
         let mut reqs = vec![Request {
             entries: vec![e1, e2],
             ptrs: vec![],
-            done: None,
+            cb: Callback::default(),
         }];
 
         vlog.write(&mut reqs).unwrap();

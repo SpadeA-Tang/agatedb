@@ -107,7 +107,7 @@ mod test {
     use tempfile::tempdir;
 
     use crate::{
-        value::{Request, VALUE_POINTER},
+        value::{Request, VALUE_POINTER, Callback},
         value_log::ValueLog,
         AgateOptions,
     };
@@ -152,7 +152,7 @@ mod test {
         let mut reqs = vec![Request {
             entries: vec![e1, e2, e3, e4],
             ptrs: vec![],
-            done: None,
+            cb: Callback::default(),
         }];
         vlog.write(&mut reqs).unwrap();
 
